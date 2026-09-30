@@ -1,15 +1,15 @@
 --[[
 ╔══════════════════════════════════════════════════════════════════╗
-║                 RENDERED EGGS ESP + FLY                     ║
+║                 RENDERED EGGS ESP + FLY                          ║
 ║                                                                  ║
 ║ • ESP all Models inside workspace.RenderedEggs                   ║
 ║ • Show name + distance at any range                              ║
 ║ • Group Eggs by name                                             ║
 ║ • Collapse / expand groups                                       ║
 ║ • Global ESP ON/OFF                                              ║
-║ • Rarity-based ESP filter                                       ║
+║ • Rarity-based ESP filter                                        ║
 ║ • Search Eggs                                                    ║
-║ • Fly to Egg using pathfinding, then return to My Plot          ║
+║ • Fly to Egg using pathfinding, then return to My Plot           ║
 ║ • Draggable and resizable menu                                   ║
 ║ • Newly spawned Eggs are detected automatically                  ║
 ║ • Automatically find the LocalPlayer plot using Data.Owner       ║
@@ -85,7 +85,7 @@ local RARITY_CONFIG = {
         Order = 1,
         Color = Color3.fromRGB(170, 170, 255),
         Eggs = {
-            "Black Hole Egg",
+            "BlackHole Egg",
             "Solaris Egg",
             "Cherub Egg",
             "Volcanic Egg"
@@ -1814,7 +1814,7 @@ SettingsPage.CanvasSize = UDim2.new(0,0,0,460)
 
 local StatusExpiresAt = 0
 
-local function showStatus(message, duration)
+showStatus = function(message, duration)
     Status.Text = message
     Status.Visible = true
     StatusExpiresAt = os.clock() + (duration or 3)
@@ -2486,12 +2486,16 @@ end
 --==============================================================
 
 local function getPathWaypoints(startPosition, targetPosition)
+    if not isValidPosition(startPosition) or not isValidPosition(targetPosition) then
+        return nil
+    end
+
     local path = PathfindingService:CreatePath({
         AgentRadius = 2,
         AgentHeight = 5,
         AgentCanJump = true,
         AgentCanClimb = true,
-        WaypointSpacing = 8
+        WaypointSpacing = 5
     })
 
     local ok = pcall(function()
@@ -2499,11 +2503,89 @@ local function getPathWaypoints(startPosition, targetPosition)
     end)
 
     if not ok or path.Status ~= Enum.PathStatus.Success then
-        return { { Position = targetPosition } }
+        return nil
     end
 
-    return path:GetWaypoints()
+    local waypoints = path:GetWaypoints()
+    if #waypoints == 0 then
+        return nil
+    end
+
+    return waypoints
 end
+
+local function isPathSegmentClear(fromPosition, toPosition, character)
+    local direction = toPosition - fromPosition
+    local distance = direction.Magnitude
+    if distance <= 0.1 then return true end
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {character, RenderedEggs}
+    params.IgnoreWater = true
+
+    local hit = workspace:Raycast(fromPosition, direction, params)
+    return hit == nil
+end
+
+local NoclipActive = false
+local NoclipOriginalCollision = {}
+
+local function setFlyNoclip(enabled)
+    getCharacter()
+
+    if enabled then
+        if NoclipActive then
+            return
+        end
+
+        NoclipOriginalCollision = {}
+        if Character and Character.Parent then
+            for _, part in ipairs(Character:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    NoclipOriginalCollision[part] = part.CanCollide
+                    part.CanCollide = false
+                end
+            end
+        end
+        NoclipActive = true
+        return
+    end
+
+    if not NoclipActive then
+        return
+    end
+
+    for part, originalValue in pairs(NoclipOriginalCollision) do
+        if part and part.Parent then
+            part.CanCollide = originalValue
+        end
+    end
+
+    NoclipOriginalCollision = {}
+    NoclipActive = false
+end
+
+local function refreshFlyNoclip()
+    if not NoclipActive then
+        return
+    end
+
+    getCharacter()
+    if not Character or not Character.Parent then
+        return
+    end
+
+    for _, part in ipairs(Character:GetDescendants()) do
+        if part:IsA("BasePart") then
+            if NoclipOriginalCollision[part] == nil then
+                NoclipOriginalCollision[part] = part.CanCollide
+            end
+            part.CanCollide = false
+        end
+    end
+end
+
 
 local function flySegment(targetPosition, token)
     getCharacter()
@@ -2524,6 +2606,7 @@ local function flySegment(targetPosition, token)
 
     while Running and FlyBusy and token == FlyCancelToken do
         getCharacter()
+        refreshFlyNoclip()
         if not RootPart or not Character or not Character.Parent then
             return false, "Character lost"
         end
@@ -2544,106 +2627,138 @@ end
 
 flyToTarget = function(model, afterEgg)
     if FlyBusy then
-        FlyCancelToken += 1
-        FlyBusy = false
-        FlyStateLabel.Text = "Fly: Cancelled  |  Speed: " .. tostring(FlySpeed)
-        return false
+        return false, "Fly is busy"
     end
-
-    if not model or not model.Parent then
-        showStatus("Egg no longer exists")
-        return false
+    if not model or not model.Parent or not model:IsDescendantOf(RenderedEggs) then
+        return false, "Egg no longer exists"
     end
 
     getCharacter()
     if not Character or not RootPart then
-        showStatus("Character not found")
-        return false
+        return false, "Character not found"
     end
 
     local eggTarget = getEggTopCFrame(model)
     if not eggTarget then
-        showStatus("Egg is not ready")
-        return false
+        return false, "Egg is not ready"
     end
 
     FlyBusy = true
     FlyCancelToken += 1
     local token = FlyCancelToken
-    FlyStateLabel.Text = "Fly: Finding path  |  Speed: " .. tostring(FlySpeed)
+    local isVolcanic = string.lower(model.Name) == "volcanic egg"
+
+    -- ONLY Volcanic Egg uses pathfinding and collision stays enabled.
+    -- Every other egg uses noclip and flies directly to the egg.
+    setFlyNoclip(not isVolcanic)
+
+    FlyStateLabel.Text = isVolcanic
+        and "Fly: Finding path  |  Speed: " .. tostring(FlySpeed)
+        or "Fly: Noclip  |  Speed: " .. tostring(FlySpeed)
     showStatus("Flying to " .. model.Name, 2)
 
-    local pathTarget = eggTarget.Position + Vector3.new(0, FlyHeight, 0)
-    local waypoints = getPathWaypoints(RootPart.Position, pathTarget)
-    local success = true
+    local function finish(ok, reason)
+        setFlyNoclip(false)
+        FlyBusy = false
+        FlyStateLabel.Text = ok
+            and ("Fly: Ready  |  Speed: " .. tostring(FlySpeed))
+            or ("Fly: Stopped  |  Speed: " .. tostring(FlySpeed))
+        return ok, reason
+    end
 
-    -- Always fly through the computed route, keeping the character above obstacles.
-    for _, waypoint in ipairs(waypoints) do
-        local waypointPosition = waypoint.Position + Vector3.new(0, FlyHeight, 0)
-        local ok = flySegment(waypointPosition, token)
-        if not ok then
-            success = false
-            break
+    local success = false
+
+    if not isVolcanic then
+        -- Other eggs: no pathfinding, no obstacle checks, just noclip direct flight.
+        success = flySegment(eggTarget.Position + Vector3.new(0, FlyHeight, 0), token)
+    else
+        -- Volcanic Egg: pathfinding is mandatory.
+        local eggRoot = getRootPart(model)
+        local navigationTarget = eggRoot and (eggRoot.Position + Vector3.new(0, 2, 0)) or eggTarget.Position
+        local waypoints = getPathWaypoints(RootPart.Position, navigationTarget)
+
+        if not waypoints then
+            showStatus("Volcanic Egg: no valid path", 2)
+            return finish(false, "No valid path to Volcanic Egg")
         end
+
+        local previousPosition = RootPart.Position
+        for _, waypoint in ipairs(waypoints) do
+            if token ~= FlyCancelToken then
+                return finish(false, "Fly cancelled")
+            end
+
+            local waypointPosition = waypoint.Position
+            if waypoint.Action == Enum.PathWaypointAction.Jump then
+                waypointPosition += Vector3.new(0, 2, 0)
+            end
+
+            if not isPathSegmentClear(previousPosition, waypointPosition, Character) then
+                showStatus("Volcanic Egg: route blocked", 2)
+                return finish(false, "Volcanic route blocked")
+            end
+
+            if not flySegment(waypointPosition, token) then
+                return finish(false, "Volcanic route failed")
+            end
+            previousPosition = waypointPosition
+        end
+
+        local finalTarget = eggTarget.Position + Vector3.new(0, FlyHeight, 0)
+        if not isPathSegmentClear(RootPart.Position, finalTarget, Character) then
+            showStatus("Volcanic Egg: final route blocked", 2)
+            return finish(false, "Volcanic final route blocked")
+        end
+
+        success = flySegment(finalTarget, token)
     end
 
-    -- Final approach directly above the egg.
-    if success and token == FlyCancelToken then
-        success = flySegment(pathTarget, token)
+    if not success then
+        if isVolcanic then
+            showStatus("Volcanic Egg: route failed, not picked up", 2)
+        else
+            showStatus("Could not reach " .. model.Name, 2)
+        end
+        return finish(false, "Could not reach egg")
     end
 
-    if success and afterEgg and FlyToPlotAfterEgg and token == FlyCancelToken then
-        -- Do not return immediately after reaching the egg.
-        -- Wait until the egg is actually collected/removed from RenderedEggs.
+    if afterEgg and FlyToPlotAfterEgg and token == FlyCancelToken then
         FlyStateLabel.Text = "Fly: Waiting for egg pickup  |  Speed: " .. tostring(FlySpeed)
         showStatus("Waiting for " .. model.Name .. " to be picked up", 3)
 
         local pickupDeadline = os.clock() + 8
-        local collected = false
-
         while Running and FlyBusy and token == FlyCancelToken and os.clock() < pickupDeadline do
-            if not model or not model.Parent or not model:IsDescendantOf(RenderedEggs) then
-                collected = true
+            if not model.Parent or not model:IsDescendantOf(RenderedEggs) then
                 break
             end
-
             RunService.Heartbeat:Wait()
         end
 
-        if not collected then
-            -- If the game keeps the rendered egg alive after pickup,
-            -- still return after the short safety timeout instead of getting stuck.
-            collected = true
+        if isVolcanic and model.Parent and model:IsDescendantOf(RenderedEggs) then
+            return finish(false, "Volcanic Egg was not picked up")
         end
 
-        if collected and Running and FlyBusy and token == FlyCancelToken then
+        if Running and FlyBusy and token == FlyCancelToken then
             local baseplate = getMyPlotBaseplate()
             if baseplate then
                 local plotTarget = getBaseplateTopCFrame(baseplate)
                 if plotTarget then
                     FlyStateLabel.Text = "Fly: Returning to My Plot  |  Speed: " .. tostring(FlySpeed)
-                    showStatus("Egg picked up - returning to My Plot", 3)
                     local teleported, reason = safeTeleport(Character, RootPart, plotTarget)
                     if not teleported then
-                        success = false
-                        showStatus("Plot teleport failed: " .. tostring(reason))
+                        return finish(false, "Plot teleport failed: " .. tostring(reason))
                     end
                 else
-                    success = false
-                    showStatus("Plot found, but baseplate target is invalid")
+                    return finish(false, "Plot target is invalid")
                 end
             else
-                success = false
-                showStatus("Egg picked up - My Plot was not found")
+                return finish(false, "My Plot was not found")
             end
         end
     end
 
-    FlyBusy = false
-    FlyStateLabel.Text = success and ("Fly: Ready  |  Speed: " .. tostring(FlySpeed)) or ("Fly: Stopped  |  Speed: " .. tostring(FlySpeed))
-    return success
+    return finish(true)
 end
-
 
 --==============================================================
 -- CREATE EGG ENTRY
@@ -3908,70 +4023,78 @@ Search:GetPropertyChangedSignal(
 -- AUTO FARM ENGINE
 --==============================================================
 
-local function isAutoFarmTarget(model)
-    if not model or not model.Parent or not model:IsDescendantOf(RenderedEggs) then
-        return false
-    end
-    if AutoFarmTargetAll then return true end
-    return AutoFarmTargets[string.lower(model.Name)] == true
-end
-
-local function findNearestAutoFarmEgg()
-    getCharacter()
-    local origin = RootPart and RootPart.Position
-    if not origin then return nil end
-    local best, bestDistance = nil, math.huge
-    for model in pairs(EggEntries) do
-        if isAutoFarmTarget(model) then
-            local root = getRootPart(model)
-            if root then
-                local distance = (origin - root.Position).Magnitude
-                if distance < bestDistance then
-                    best = model
-                    bestDistance = distance
-                end
-            end
-        end
-    end
-    return best
-end
-
 runAutoFarm = function()
     if AutoFarmBusy or not AutoFarmEnabled or not Running then return end
     AutoFarmBusy = true
     AutoFarmToken += 1
     local token = AutoFarmToken
 
-    while Running and AutoFarmEnabled and token == AutoFarmToken do
-        local egg = findNearestAutoFarmEgg()
-        if egg then
+    local ok, err = pcall(function()
+        while Running and AutoFarmEnabled and token == AutoFarmToken do
+            getCharacter()
+            local origin = RootPart and RootPart.Position
+            local egg = nil
+            local bestDistance = math.huge
+
+            if origin then
+                for model in pairs(EggEntries) do
+                    if model and model.Parent and model:IsDescendantOf(RenderedEggs) then
+                        local targetAllowed = AutoFarmTargetAll
+                        if not targetAllowed then
+                            targetAllowed = AutoFarmTargets[string.lower(model.Name)] == true
+                        end
+
+                        if targetAllowed then
+                            local root = getRootPart(model)
+                            if root then
+                                local distance = (origin - root.Position).Magnitude
+                                if distance < bestDistance then
+                                    egg = model
+                                    bestDistance = distance
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+
+            if not egg then
+                if AutoFarmListOpen then refreshAutoFarmRows() end
+                task.wait(0.35)
+                continue
+            end
+
             if AutoFarmMode == "TP" then
                 getCharacter()
                 local target = getEggTopCFrame(egg)
                 if Character and RootPart and target then
-                    local ok = safeTeleport(Character, RootPart, target)
-                    if ok then showStatus("Auto TP -> " .. egg.Name, 0.8) end
+                    local teleported = safeTeleport(Character, RootPart, target)
+                    if teleported then
+                        showStatus("Auto TP -> " .. egg.Name, 0.8)
+                    end
                 end
                 task.wait(AutoFarmDelay)
-            elseif not FlyBusy then
-                task.spawn(function()
+            else
+                -- Run Fly synchronously so Auto Farm never starts multiple
+                -- Fly jobs for the same egg and never loses track of FlyBusy.
+                if not FlyBusy then
                     flyToTarget(egg, true)
-                end)
-                local deadline = os.clock() + 12
-                while Running and AutoFarmEnabled and token == AutoFarmToken and FlyBusy and os.clock() < deadline do
+                    task.wait(AutoFarmDelay)
+                else
                     task.wait(0.08)
                 end
-            else
-                task.wait(0.08)
             end
-        else
-            if AutoFarmListOpen then refreshAutoFarmRows() end
-            task.wait(0.35)
         end
+    end)
+
+    if not ok then
+        warn("[AutoFarm] " .. tostring(err))
+        FlyBusy = false
     end
 
     AutoFarmBusy = false
 end
+
 
 --==============================================================
 -- UPDATE LOOP
@@ -4145,7 +4268,7 @@ end)
 -- SHUTDOWN
 --==============================================================
 
-local function shutdown()
+shutdown = function()
 
     if not Running then
         return
