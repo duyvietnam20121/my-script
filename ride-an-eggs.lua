@@ -1,15 +1,15 @@
 --[[
 ╔══════════════════════════════════════════════════════════════════╗
-║                 RENDERED EGGS ESP + FLY                          ║
+║                 RENDERED EGGS ESP + FLY                     ║
 ║                                                                  ║
 ║ • ESP all Models inside workspace.RenderedEggs                   ║
 ║ • Show name + distance at any range                              ║
 ║ • Group Eggs by name                                             ║
 ║ • Collapse / expand groups                                       ║
 ║ • Global ESP ON/OFF                                              ║
-║ • Rarity-based ESP filter                                        ║
+║ • Rarity-based ESP filter                                       ║
 ║ • Search Eggs                                                    ║
-║ • Fly to Egg using pathfinding, then return to My Plot           ║
+║ • Fly to Egg using pathfinding, then return to My Plot          ║
 ║ • Draggable and resizable menu                                   ║
 ║ • Newly spawned Eggs are detected automatically                  ║
 ║ • Automatically find the LocalPlayer plot using Data.Owner       ║
@@ -1578,7 +1578,7 @@ AutoFarmModeCorner.Parent = AutoFarmModeButton
 local AutoFarmTargetButton = Instance.new("TextButton")
 AutoFarmTargetButton.Size = UDim2.new(1,0,0,34)
 AutoFarmTargetButton.BackgroundColor3 = Color3.fromRGB(48,50,65)
-AutoFarmTargetButton.Text = "TARGET: ALL EGGS  [click for list]"
+AutoFarmTargetButton.Text = "RARITY: ALL  [click for list]"
 AutoFarmTargetButton.TextColor3 = Color3.fromRGB(230,232,242)
 AutoFarmTargetButton.Font = Enum.Font.GothamBold
 AutoFarmTargetButton.TextSize = 11
@@ -1626,35 +1626,44 @@ end
 local function refreshAutoFarmTargetButton()
     local count = 0
     for _ in pairs(AutoFarmTargets) do count += 1 end
+
     if AutoFarmTargetAll then
-        AutoFarmTargetButton.Text = "TARGET: ALL EGGS  [click for list]"
+        AutoFarmTargetButton.Text = "RARITY: ALL  [click for list]"
     elseif count == 0 then
-        AutoFarmTargetButton.Text = "TARGET: NONE  [click for list]"
+        AutoFarmTargetButton.Text = "RARITY: NONE  [click for list]"
     elseif count == 1 then
-        local selected
-        for key in pairs(AutoFarmTargets) do selected = key break end
-        AutoFarmTargetButton.Text = "TARGET: " .. tostring(selected) .. "  [list]"
+        for key in pairs(AutoFarmTargets) do
+            AutoFarmTargetButton.Text = "RARITY: " .. tostring(key) .. "  [list]"
+            break
+        end
     else
-        AutoFarmTargetButton.Text = "TARGET: " .. tostring(count) .. " TYPES  [list]"
+        AutoFarmTargetButton.Text = "RARITY: " .. tostring(count) .. " TYPES  [list]"
     end
 end
 
 local function refreshAutoFarmRows()
+    -- Auto Farm chọn theo ĐỘ HIẾM, không chọn từng egg.
     local names = {}
-    local seen = {}
-    for model in pairs(EggEntries) do
-        if model and model.Parent then
-            local key = string.lower(model.Name)
-            if not seen[key] then
-                seen[key] = true
-                table.insert(names, model.Name)
-            end
-        end
+
+    for _, rarityInfo in ipairs(RARITY_CONFIG) do
+        table.insert(names, tostring(rarityInfo.Name))
     end
-    table.sort(names, function(a,b) return string.lower(a) < string.lower(b) end)
+
+    table.sort(names, function(a, b)
+        local ra = RarityByName[string.lower(a)]
+        local rb = RarityByName[string.lower(b)]
+        return (ra and ra.Order or 999) < (rb and rb.Order or 999)
+    end)
 
     for key, row in pairs(AutoFarmRows) do
-        if not seen[key] then
+        local found = false
+        for _, name in ipairs(names) do
+            if key == string.lower(name) then
+                found = true
+                break
+            end
+        end
+        if not found then
             row:Destroy()
             AutoFarmRows[key] = nil
         end
@@ -1664,38 +1673,55 @@ local function refreshAutoFarmRows()
         local key = string.lower(name)
         if not AutoFarmRows[key] then
             local row = Instance.new("TextButton")
-            row.Name = "Target_" .. name
-            row.Size = UDim2.new(1,0,0,28)
+            row.Name = "Rarity_" .. name
+            row.Size = UDim2.new(1, 0, 0, 28)
             row.BackgroundColor3 = Color3.fromRGB(34,35,44)
             row.TextColor3 = Color3.fromRGB(225,228,240)
             row.Font = Enum.Font.GothamBold
             row.TextSize = 10
             row.AutoButtonColor = false
             row.Parent = AutoFarmList
+
             local c = Instance.new("UICorner")
             c.CornerRadius = UDim.new(0,6)
             c.Parent = row
+
             row.MouseButton1Click:Connect(function()
                 AutoFarmTargetAll = false
                 AutoFarmTargets[key] = not AutoFarmTargets[key]
-                if not AutoFarmTargets[key] then AutoFarmTargets[key] = nil end
+                if not AutoFarmTargets[key] then
+                    AutoFarmTargets[key] = nil
+                end
                 refreshAutoFarmRows()
                 refreshAutoFarmTargetButton()
             end)
+
             AutoFarmRows[key] = row
         end
+
         local row = AutoFarmRows[key]
         local on = AutoFarmTargetAll or getAutoFarmTargetState(name)
         row.Text = (on and "[ON] " or "[OFF] ") .. name
-        row.BackgroundColor3 = on and Color3.fromRGB(48,50,65) or Color3.fromRGB(34,35,44)
+        row.BackgroundColor3 = on
+            and Color3.fromRGB(48,50,65)
+            or Color3.fromRGB(34,35,44)
     end
 end
 
 local function setAutoFarmListOpen(open)
-    AutoFarmListOpen = open
-    AutoFarmList.Visible = open
-    if open then refreshAutoFarmRows() end
-    if relayoutSettings then relayoutSettings() end
+    AutoFarmListOpen = open == true
+    AutoFarmList.Visible = AutoFarmListOpen
+    AutoFarmTargetButton.TextColor3 = AutoFarmListOpen
+        and Color3.fromRGB(255,255,255)
+        or Color3.fromRGB(230,232,242)
+
+    if AutoFarmListOpen then
+        refreshAutoFarmRows()
+    end
+
+    if relayoutSettings then
+        relayoutSettings()
+    end
 end
 
 AutoFarmTargetButton.MouseButton1Click:Connect(function()
@@ -1704,15 +1730,27 @@ end)
 
 AutoFarmModeButton.MouseButton1Click:Connect(function()
     AutoFarmMode = AutoFarmMode == "TP" and "Fly" or "TP"
-    AutoFarmModeButton.Text = "MODE: " .. string.upper(AutoFarmMode)
-    AutoFarmModeButton.BackgroundColor3 = AutoFarmMode == "TP" and Color3.fromRGB(72,155,105) or Color3.fromRGB(77,97,175)
+    AutoFarmModeButton.Text = AutoFarmMode == "TP"
+        and "MODE: TP"
+        or "MODE: FLY"
+    AutoFarmModeButton.BackgroundColor3 = AutoFarmMode == "TP"
+        and Color3.fromRGB(72,155,105)
+        or Color3.fromRGB(77,97,175)
 end)
 
 AutoFarmToggle.MouseButton1Click:Connect(function()
     AutoFarmEnabled = not AutoFarmEnabled
-    AutoFarmToggle.Text = AutoFarmEnabled and "AUTO FARM: ON" or "AUTO FARM: OFF"
-    AutoFarmToggle.BackgroundColor3 = AutoFarmEnabled and Color3.fromRGB(60,145,90) or Color3.fromRGB(145,65,75)
+
+    AutoFarmToggle.Text = AutoFarmEnabled
+        and "AUTO FARM: ON"
+        or "AUTO FARM: OFF"
+
+    AutoFarmToggle.BackgroundColor3 = AutoFarmEnabled
+        and Color3.fromRGB(60,145,90)
+        or Color3.fromRGB(145,65,75)
+
     if AutoFarmEnabled then
+        refreshAutoFarmRows()
         showStatus("Auto Farm " .. AutoFarmMode .. " started", 2)
         task.spawn(runAutoFarm)
     else
@@ -1725,12 +1763,15 @@ AutoFarmToggle.MouseButton1Click:Connect(function()
     end
 end)
 
+-- Right click = select every egg type.
 AutoFarmTargetButton.MouseButton2Click:Connect(function()
     AutoFarmTargetAll = true
     AutoFarmTargets = {}
     refreshAutoFarmRows()
     refreshAutoFarmTargetButton()
 end)
+
+refreshAutoFarmRows()
 refreshAutoFarmTargetButton()
 
 -- Responsive settings layout. Sections push the controls below them
@@ -4041,7 +4082,9 @@ runAutoFarm = function()
                     if model and model.Parent and model:IsDescendantOf(RenderedEggs) then
                         local targetAllowed = AutoFarmTargetAll
                         if not targetAllowed then
-                            targetAllowed = AutoFarmTargets[string.lower(model.Name)] == true
+                            local rarityInfo = getManualRarity(model.Name)
+                            local rarityKey = rarityInfo and string.lower(tostring(rarityInfo.Name)) or nil
+                            targetAllowed = rarityKey ~= nil and AutoFarmTargets[rarityKey] == true
                         end
 
                         if targetAllowed then
