@@ -9,7 +9,7 @@
 ║ • Global ESP ON/OFF                                              ║
 ║ • Rarity-based ESP filter                                        ║
 ║ • Search Eggs                                                    ║
-║ • Fly to Egg using pathfinding, then return to My Plot           ║
+║ • Fly to Egg (TP first for Volcanic/Auto Farm, then noclip fly)  ║
 ║ • Draggable and resizable menu                                   ║
 ║ • Newly spawned Eggs are detected automatically                  ║
 ║ • Automatically find the LocalPlayer plot using Data.Owner       ║
@@ -24,7 +24,6 @@
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
-local PathfindingService = game:GetService("PathfindingService")
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
@@ -62,7 +61,9 @@ local applySuperOptimization
 local FlySpeed = 250
 local MIN_FLY_SPEED = 100
 local MAX_FLY_SPEED = 500
-local FlyHeight = 3 -- hover height above the egg's top (was 10, too far for server checks)
+local APPROACH_DISTANCE = 1   -- fly until the character is this many studs from the egg
+local STAGE_HEIGHT = 15       -- TP first to this height above the egg, then fly noclip down to it
+local PICKUP_CONFIRM_TIMEOUT = 4 -- seconds to wait for the egg to disappear after the pickup fire
 local FlyToPlotAfterEgg = true
 
 -- Pickup settings
@@ -359,7 +360,7 @@ local function resolveEggModel(model)
 end
 
 
--- Hover position just above the egg's real top (bounding box + FlyHeight).
+-- Closest approach point: APPROACH_DISTANCE studs above the egg's real top (bounding box).
 local function getEggHoverPosition(model)
     local ok, cf, size = pcall(function()
         return model:GetBoundingBox()
@@ -368,12 +369,12 @@ local function getEggHoverPosition(model)
     if ok and typeof(cf) == "CFrame" and typeof(size) == "Vector3"
         and isValidPosition(cf.Position) and isFiniteNumber(size.Y) then
 
-        return cf.Position + Vector3.new(0, size.Y * 0.5 + FlyHeight, 0)
+        return cf.Position + Vector3.new(0, size.Y * 0.5 + APPROACH_DISTANCE, 0)
     end
 
     local root = getRootPart(model)
     if root then
-        return root.Position + Vector3.new(0, FlyHeight + 2, 0)
+        return root.Position + Vector3.new(0, APPROACH_DISTANCE, 0)
     end
 
     return nil
@@ -1750,51 +1751,8 @@ end
 
 
 --==============================================================
--- FLY PATH
+-- FLY (noclip)
 --==============================================================
-
-local function getPathWaypoints(startPosition, targetPosition)
-    if not isValidPosition(startPosition) or not isValidPosition(targetPosition) then
-        return nil
-    end
-
-    local path = PathfindingService:CreatePath({
-        AgentRadius = 2,
-        AgentHeight = 5,
-        AgentCanJump = true,
-        AgentCanClimb = true,
-        WaypointSpacing = 5
-    })
-
-    local ok = pcall(function()
-        path:ComputeAsync(startPosition, targetPosition)
-    end)
-
-    if not ok or path.Status ~= Enum.PathStatus.Success then
-        return nil
-    end
-
-    local waypoints = path:GetWaypoints()
-    if #waypoints == 0 then
-        return nil
-    end
-
-    return waypoints
-end
-
-local function isPathSegmentClear(fromPosition, toPosition, character)
-    local direction = toPosition - fromPosition
-    local distance = direction.Magnitude
-    if distance <= 0.1 then return true end
-
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances = {character, RenderedEggs}
-    params.IgnoreWater = true
-
-    local hit = workspace:Raycast(fromPosition, direction, params)
-    return hit == nil
-end
 
 local NoclipActive = false
 local NoclipOriginalCollision = {}
@@ -1893,7 +1851,7 @@ local function flySegment(targetPosition, token)
     return false, "Fly cancelled"
 end
 
-flyToTarget = function(model, afterEgg)
+flyToTarget = function(model, afterEgg, stageFirst)
     if FlyBusy then
         return false, "Fly is busy"
     end
@@ -1909,24 +1867,23 @@ flyToTarget = function(model, afterEgg)
         return false, "Character not found"
     end
 
-    local eggTarget = getEggTopCFrame(model)
     local hoverPosition = getEggHoverPosition(model)
-    if not eggTarget or not hoverPosition then
+    if not hoverPosition then
         return false, "Egg is not ready"
     end
 
     FlyBusy = true
     FlyCancelToken += 1
     local token = FlyCancelToken
+
+    -- Volcanic Egg (and Auto Farm) always TP first, then fly noclip to the egg.
     local isVolcanic = string.lower(model.Name) == "volcanic egg"
+    local doStage = stageFirst == true or isVolcanic
 
-    -- ONLY Volcanic Egg uses pathfinding and collision stays enabled.
-    -- Every other egg uses noclip and flies directly to the egg.
-    setFlyNoclip(not isVolcanic)
+    -- Pathfinding was removed: every egg uses noclip.
+    setFlyNoclip(true)
 
-    FlyStateLabel.Text = isVolcanic
-        and "Fly: Finding path  |  Speed: " .. tostring(FlySpeed)
-        or "Fly: Noclip  |  Speed: " .. tostring(FlySpeed)
+    FlyStateLabel.Text = "Fly: Noclip  |  Speed: " .. tostring(FlySpeed)
     showStatus("Flying to " .. model.Name, 2)
 
     local function finish(ok, reason)
@@ -1938,59 +1895,24 @@ flyToTarget = function(model, afterEgg)
         return ok, reason
     end
 
-    local success = false
-
-    if not isVolcanic then
-        -- Other eggs: no pathfinding, no obstacle checks, just noclip direct flight.
-        success = flySegment(hoverPosition, token)
-    else
-        -- Volcanic Egg: pathfinding is mandatory.
-        local eggRoot = getRootPart(model)
-        local navigationTarget = eggRoot and (eggRoot.Position + Vector3.new(0, 2, 0)) or hoverPosition
-        local waypoints = getPathWaypoints(RootPart.Position, navigationTarget)
-
-        if not waypoints then
-            showStatus("Volcanic Egg: no valid path", 2)
-            return finish(false, "No valid path to Volcanic Egg")
+    -- Step 1: TP to a staging point above the egg.
+    if doStage then
+        local stagePosition = hoverPosition + Vector3.new(0, STAGE_HEIGHT, 0)
+        local teleported, reason = safeTeleport(Character, RootPart, CFrame.new(stagePosition))
+        if not teleported then
+            showStatus("TP failed: " .. tostring(reason), 2)
+            return finish(false, "Stage teleport failed: " .. tostring(reason))
         end
-
-        local previousPosition = RootPart.Position
-        for _, waypoint in ipairs(waypoints) do
-            if token ~= FlyCancelToken then
-                return finish(false, "Fly cancelled")
-            end
-
-            local waypointPosition = waypoint.Position
-            if waypoint.Action == Enum.PathWaypointAction.Jump then
-                waypointPosition += Vector3.new(0, 2, 0)
-            end
-
-            if not isPathSegmentClear(previousPosition, waypointPosition, Character) then
-                showStatus("Volcanic Egg: route blocked", 2)
-                return finish(false, "Volcanic route blocked")
-            end
-
-            if not flySegment(waypointPosition, token) then
-                return finish(false, "Volcanic route failed")
-            end
-            previousPosition = waypointPosition
-        end
-
-        local finalTarget = hoverPosition
-        if not isPathSegmentClear(RootPart.Position, finalTarget, Character) then
-            showStatus("Volcanic Egg: final route blocked", 2)
-            return finish(false, "Volcanic final route blocked")
-        end
-
-        success = flySegment(finalTarget, token)
+        showStatus("TP -> " .. model.Name, 0.6)
     end
 
+    -- Step 2: fly noclip to the closest point (APPROACH_DISTANCE studs) of the egg.
+    -- Re-read the position in case the egg moved or streamed in meanwhile.
+    hoverPosition = getEggHoverPosition(model) or hoverPosition
+    local success = flySegment(hoverPosition, token)
+
     if not success then
-        if isVolcanic then
-            showStatus("Volcanic Egg: route failed, not picked up", 2)
-        else
-            showStatus("Could not reach " .. model.Name, 2)
-        end
+        showStatus("Could not reach " .. model.Name, 2)
         return finish(false, "Could not reach egg")
     end
 
@@ -2008,16 +1930,12 @@ flyToTarget = function(model, afterEgg)
         FlyStateLabel.Text = "Fly: Waiting for egg pickup  |  Speed: " .. tostring(FlySpeed)
         showStatus("Waiting for " .. model.Name .. " to be picked up", 3)
 
-        local pickupDeadline = os.clock() + 8
+        local pickupDeadline = os.clock() + PICKUP_CONFIRM_TIMEOUT
         while Running and FlyBusy and token == FlyCancelToken and os.clock() < pickupDeadline do
             if not model.Parent or not model:IsDescendantOf(RenderedEggs) then
                 break
             end
             RunService.Heartbeat:Wait()
-        end
-
-        if isVolcanic and model.Parent and model:IsDescendantOf(RenderedEggs) then
-            return finish(false, "Volcanic Egg was not picked up")
         end
 
         if Running and FlyBusy and token == FlyCancelToken then
@@ -3165,59 +3083,13 @@ runAutoFarm = function()
                 continue
             end
 
-            -- Auto Farm tự chọn cách di chuyển:
-            -- mọi egg dùng TP; riêng Volcanic Egg dùng Pathfinding.
-            if string.lower(egg.Name) == "volcanic egg" then
-                if not FlyBusy then
-                    -- Auto Farm luôn bật đường quay về My Plot sau khi pickup.
-                    local previousReturn = FlyToPlotAfterEgg
-                    FlyToPlotAfterEgg = true
-                    flyToTarget(egg, true)
-                    FlyToPlotAfterEgg = previousReturn
-                end
-            else
-                getCharacter()
-                -- FIX: hover just above the egg (FlyHeight) instead of ~20 studs up.
-                local hover = getEggHoverPosition(egg)
-                if Character and RootPart and hover then
-                    local teleported = safeTeleport(Character, RootPart, CFrame.new(hover))
-                    if teleported then
-                        showStatus("Auto TP -> " .. egg.Name, 0.8)
-                    end
-                end
-
-                -- Kích hoạt Pickup ngay sau khi TP tới egg.
-                if egg.Parent and egg:IsDescendantOf(RenderedEggs) then
-                    local picked, how = instantPickupEgg(egg)
-                    if picked then
-                        showStatus("Auto Pickup -> " .. egg.Name, 0.6)
-                    else
-                        showStatus("Auto Pickup failed: " .. tostring(how), 1.5)
-                    end
-                end
-
-                -- Chờ egg được nhặt/xóa, sau đó tự quay về My Plot
-                -- trước khi bắt đầu vòng Auto Farm tiếp theo.
-                local deadline = os.clock() + 3
-                while Running and AutoFarmEnabled and token == AutoFarmToken
-                    and egg.Parent and egg:IsDescendantOf(RenderedEggs)
-                    and os.clock() < deadline do
-                    task.wait(0.05)
-                end
-
-                if Running and AutoFarmEnabled and token == AutoFarmToken then
-                    getCharacter()
-                    local baseplate = getMyPlotBaseplate()
-                    if baseplate and Character and RootPart then
-                        local plotTarget = getBaseplateTopCFrame(baseplate)
-                        if plotTarget then
-                            local returned = safeTeleport(Character, RootPart, plotTarget)
-                            if returned then
-                                showStatus("Auto Farm -> My Plot", 0.7)
-                            end
-                        end
-                    end
-                end
+            -- Auto Farm: TP first, then fly noclip to APPROACH_DISTANCE (1 stud) from the egg,
+            -- pickup, then return to My Plot. flyToTarget handles every step.
+            if not FlyBusy then
+                local previousReturn = FlyToPlotAfterEgg
+                FlyToPlotAfterEgg = true
+                flyToTarget(egg, true, true)
+                FlyToPlotAfterEgg = previousReturn
             end
 
             task.wait(AutoFarmDelay)
