@@ -1,21 +1,23 @@
 --[[
 ╔══════════════════════════════════════════════════════════════════╗
-║                 RENDERED EGGS ESP + FLY                     ║
+║                 RENDERED EGGS ESP + FLY                          ║
 ║                                                                  ║
 ║ • ESP all Models inside workspace.RenderedEggs                   ║
 ║ • Show name + distance at any range                              ║
 ║ • Group Eggs by name                                             ║
 ║ • Collapse / expand groups                                       ║
 ║ • Global ESP ON/OFF                                              ║
-║ • Rarity-based ESP filter                                       ║
+║ • Rarity-based ESP filter                                        ║
 ║ • Search Eggs                                                    ║
-║ • Fly to Egg using pathfinding, then return to My Plot          ║
+║ • Fly to Egg using pathfinding, then return to My Plot           ║
 ║ • Draggable and resizable menu                                   ║
 ║ • Newly spawned Eggs are detected automatically                  ║
 ║ • Automatically find the LocalPlayer plot using Data.Owner       ║
 ║ • workspace.Plots is scanned at most 2 times                     ║
 ║ • Configurable Fly Speed 100-500                                 ║
 ║ • No script-side teleport distance limit                         ║
+║ • Pickup fix: resolves the top-level egg model, waits for the    ║
+║   ProximityPrompt, fuzzy-matches its name, debug dump on miss    ║
 ╚══════════════════════════════════════════════════════════════════╝
 ]]
 
@@ -60,12 +62,14 @@ local applySuperOptimization
 local FlySpeed = 250
 local MIN_FLY_SPEED = 100
 local MAX_FLY_SPEED = 500
-local FlyHeight = 10
+local FlyHeight = 3 -- hover height above the egg's top (was 10, too far for server checks)
 local FlyToPlotAfterEgg = true
+
+-- Pickup settings
+local PICKUP_WAIT_TIMEOUT = 2
 
 -- Auto Farm settings
 local AutoFarmEnabled = false
-local AutoFarmMode = "TP" -- TP / Fly
 local AutoFarmTargetAll = true
 local AutoFarmTargets = {}
 local AutoFarmBusy = false
@@ -229,6 +233,13 @@ local getBaseplateTopCFrame = nil
 local FlyBusy = false
 local FlyCancelToken = 0
 
+-- Forward declarations (previously leaked as globals)
+local showStatus = nil
+local shutdown = nil
+local getEggPickupPrompt = nil
+local instantPickupEgg = nil
+local debugEggHierarchy = nil
+
 
 --==============================================================
 -- UTILITY
@@ -326,21 +337,72 @@ local function getRootPart(model)
 end
 
 
+-- Returns the top-level Model that sits directly under RenderedEggs.
+-- Prevents registering nested sub-models (accessories, mesh groups...)
+-- as separate eggs while the ProximityPrompt lives on the parent.
+local function resolveEggModel(model)
+    local top = model
+    local parent = model.Parent
+
+    while parent
+        and parent ~= RenderedEggs
+        and parent:IsDescendantOf(RenderedEggs) do
+
+        if parent:IsA("Model") then
+            top = parent
+        end
+
+        parent = parent.Parent
+    end
+
+    return top
+end
+
+
+-- Hover position just above the egg's real top (bounding box + FlyHeight).
+local function getEggHoverPosition(model)
+    local ok, cf, size = pcall(function()
+        return model:GetBoundingBox()
+    end)
+
+    if ok and typeof(cf) == "CFrame" and typeof(size) == "Vector3"
+        and isValidPosition(cf.Position) and isFiniteNumber(size.Y) then
+
+        return cf.Position + Vector3.new(0, size.Y * 0.5 + FlyHeight, 0)
+    end
+
+    local root = getRootPart(model)
+    if root then
+        return root.Position + Vector3.new(0, FlyHeight + 2, 0)
+    end
+
+    return nil
+end
+
+
+-- UI helpers (keep the main chunk under Luau's 200-local limit)
+local function addCorner(parent, radius)
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = radius
+    corner.Parent = parent
+end
+
+local function addPadding(parent, left)
+    local pad = Instance.new("UIPadding")
+    pad.PaddingLeft = UDim.new(0, left)
+    pad.Parent = parent
+end
+
+
 --==============================================================
 -- GUI
 --==============================================================
 
-local ScreenGui =
-    Instance.new("ScreenGui")
-
-ScreenGui.Name =
-    "RenderedEggESP"
-
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "RenderedEggESP"
 ScreenGui.ResetOnSpawn = false
 ScreenGui.IgnoreGuiInset = true
-ScreenGui.ZIndexBehavior =
-    Enum.ZIndexBehavior.Sibling
-
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 ScreenGui.Parent = PlayerGui
 
 
@@ -348,43 +410,14 @@ ScreenGui.Parent = PlayerGui
 -- MAIN
 --==============================================================
 
-local Main =
-    Instance.new("Frame")
-
+local Main = Instance.new("Frame")
 Main.Name = "Main"
-
-Main.Size =
-    UDim2.new(
-        0,
-        430,
-        0,
-        560
-    )
-
-Main.AnchorPoint =
-    Vector2.new(
-        0.5,
-        0.5
-    )
-
-Main.Position =
-    UDim2.new(
-        0.5,
-        0,
-        0.5,
-        0
-    )
-
-Main.BackgroundColor3 =
-    Color3.fromRGB(
-        22,
-        23,
-        30
-    )
-
+Main.Size = UDim2.new(0, 430, 0, 560)
+Main.AnchorPoint = Vector2.new(0.5, 0.5)
+Main.Position = UDim2.new(0.5, 0, 0.5, 0)
+Main.BackgroundColor3 = Color3.fromRGB(22, 23, 30)
 Main.BorderSizePixel = 0
 Main.ClipsDescendants = true
-
 Main.Parent = ScreenGui
 
 local MainExpandedSize = Main.Size
@@ -433,306 +466,96 @@ if workspace.CurrentCamera then
 end
 
 
-local MainCorner =
-    Instance.new("UICorner")
-
-MainCorner.CornerRadius =
-    UDim.new(0, 14)
-
-MainCorner.Parent = Main
+addCorner(Main, UDim.new(0, 14))
 
 
-local MainStroke =
-    Instance.new("UIStroke")
-
-MainStroke.Color =
-    Color3.fromRGB(
-        75,
-        78,
-        100
-    )
-
+local MainStroke = Instance.new("UIStroke")
+MainStroke.Color = Color3.fromRGB(75, 78, 100)
 MainStroke.Thickness = 1.5
 MainStroke.Transparency = 0.2
-
 MainStroke.Parent = Main
 
 
-local ResizeHandle =
-    Instance.new("TextButton")
-
-ResizeHandle.Size =
-    UDim2.new(
-        0,
-        32,
-        0,
-        32
-    )
-
-ResizeHandle.AnchorPoint =
-    Vector2.new(1, 1)
-
-ResizeHandle.Position =
-    UDim2.new(1, -6, 1, -6)
-
-ResizeHandle.BackgroundColor3 =
-    Color3.fromRGB(
-        62,
-        64,
-        82
-    )
-
-ResizeHandle.Text =
-    ">"
-
-ResizeHandle.TextColor3 =
-    Color3.fromRGB(
-        240,
-        240,
-        248
-    )
-
-ResizeHandle.Font =
-    Enum.Font.GothamBold
-
+local ResizeHandle = Instance.new("TextButton")
+ResizeHandle.Size = UDim2.new(0, 32, 0, 32)
+ResizeHandle.AnchorPoint = Vector2.new(1, 1)
+ResizeHandle.Position = UDim2.new(1, -6, 1, -6)
+ResizeHandle.BackgroundColor3 = Color3.fromRGB(62, 64, 82)
+ResizeHandle.Text = ">"
+ResizeHandle.TextColor3 = Color3.fromRGB(240, 240, 248)
+ResizeHandle.Font = Enum.Font.GothamBold
 ResizeHandle.TextSize = 16
 ResizeHandle.ZIndex = 5
-
 ResizeHandle.Parent = Main
 
 
-local ResizeCorner =
-    Instance.new("UICorner")
-
-ResizeCorner.CornerRadius =
-    UDim.new(0, 8)
-
-ResizeCorner.Parent = ResizeHandle
+addCorner(ResizeHandle, UDim.new(0, 8))
 
 
 --==============================================================
 -- TOP BAR
 --==============================================================
 
-local TopBar =
-    Instance.new("Frame")
-
-TopBar.Size =
-    UDim2.new(
-        1,
-        0,
-        0,
-        56
-    )
-
-TopBar.BackgroundColor3 =
-    Color3.fromRGB(
-        35,
-        36,
-        48
-    )
-
+local TopBar = Instance.new("Frame")
+TopBar.Size = UDim2.new(1, 0, 0, 56)
+TopBar.BackgroundColor3 = Color3.fromRGB(35, 36, 48)
 TopBar.BorderSizePixel = 0
 TopBar.ClipsDescendants = true
-
 TopBar.Parent = Main
 
 
-local TopCorner =
-    Instance.new("UICorner")
-
-TopCorner.CornerRadius =
-    UDim.new(0, 14)
-
-TopCorner.Parent = TopBar
+addCorner(TopBar, UDim.new(0, 14))
 
 
-local Accent =
-    Instance.new("Frame")
-
-Accent.Size =
-    UDim2.new(
-        0,
-        5,
-        1,
-        -18
-    )
-
-Accent.Position =
-    UDim2.new(
-        0,
-        9,
-        0,
-        9
-    )
-
-Accent.BackgroundColor3 =
-    Color3.fromRGB(
-        110,
-        130,
-        255
-    )
-
+local Accent = Instance.new("Frame")
+Accent.Size = UDim2.new(0, 5, 1, -18)
+Accent.Position = UDim2.new(0, 9, 0, 9)
+Accent.BackgroundColor3 = Color3.fromRGB(110, 130, 255)
 Accent.BorderSizePixel = 0
-
 Accent.Parent = TopBar
 
 
-local AccentCorner =
-    Instance.new("UICorner")
-
-AccentCorner.CornerRadius =
-    UDim.new(1, 0)
-
-AccentCorner.Parent = Accent
+addCorner(Accent, UDim.new(1, 0))
 
 
-local Title =
-    Instance.new("TextLabel")
-
+local Title = Instance.new("TextLabel")
 Title.BackgroundTransparency = 1
-
-Title.Position =
-    UDim2.new(
-        0,
-        25,
-        0,
-        7
-    )
-
-Title.Size =
-    UDim2.new(
-        1,
-        -140,
-        0,
-        24
-    )
-
-Title.Font =
-    Enum.Font.GothamBold
-
+Title.Position = UDim2.new(0, 25, 0, 7)
+Title.Size = UDim2.new(1, -140, 0, 24)
+Title.Font = Enum.Font.GothamBold
 Title.TextSize = 17
-
-Title.TextColor3 =
-    Color3.fromRGB(
-        245,
-        245,
-        255
-    )
-
-Title.TextXAlignment =
-    Enum.TextXAlignment.Left
-
-Title.Text =
-    "Rendered Eggs"
-
+Title.TextColor3 = Color3.fromRGB(245, 245, 255)
+Title.TextXAlignment = Enum.TextXAlignment.Left
+Title.Text = "Rendered Eggs"
 Title.Parent = TopBar
 
 
-local Minimize =
-    Instance.new("TextButton")
-
-Minimize.Size =
-    UDim2.new(
-        0,
-        36,
-        0,
-        36
-    )
-
-Minimize.Position =
-    UDim2.new(
-        1,
-        -85,
-        0,
-        10
-    )
-
-Minimize.BackgroundColor3 =
-    Color3.fromRGB(
-        62,
-        64,
-        82
-    )
-
-Minimize.Text =
-    "-"
-
-Minimize.TextColor3 =
-    Color3.fromRGB(
-        255,
-        255,
-        255
-    )
-
-Minimize.Font =
-    Enum.Font.GothamBold
-
+local Minimize = Instance.new("TextButton")
+Minimize.Size = UDim2.new(0, 36, 0, 36)
+Minimize.Position = UDim2.new(1, -85, 0, 10)
+Minimize.BackgroundColor3 = Color3.fromRGB(62, 64, 82)
+Minimize.Text = "-"
+Minimize.TextColor3 = Color3.fromRGB(255, 255, 255)
+Minimize.Font = Enum.Font.GothamBold
 Minimize.TextSize = 20
-
 Minimize.Parent = TopBar
 
 
-local MinimizeCorner =
-    Instance.new("UICorner")
-
-MinimizeCorner.CornerRadius =
-    UDim.new(0, 9)
-
-MinimizeCorner.Parent = Minimize
+addCorner(Minimize, UDim.new(0, 9))
 
 
-local Close =
-    Instance.new("TextButton")
-
-Close.Size =
-    UDim2.new(
-        0,
-        36,
-        0,
-        36
-    )
-
-Close.Position =
-    UDim2.new(
-        1,
-        -45,
-        0,
-        10
-    )
-
-Close.BackgroundColor3 =
-    Color3.fromRGB(
-        180,
-        60,
-        70
-    )
-
-Close.Text =
-    "X"
-
-Close.TextColor3 =
-    Color3.fromRGB(
-        255,
-        255,
-        255
-    )
-
-Close.Font =
-    Enum.Font.GothamBold
-
+local Close = Instance.new("TextButton")
+Close.Size = UDim2.new(0, 36, 0, 36)
+Close.Position = UDim2.new(1, -45, 0, 10)
+Close.BackgroundColor3 = Color3.fromRGB(180, 60, 70)
+Close.Text = "X"
+Close.TextColor3 = Color3.fromRGB(255, 255, 255)
+Close.Font = Enum.Font.GothamBold
 Close.TextSize = 20
-
 Close.Parent = TopBar
 
 
-local CloseCorner =
-    Instance.new("UICorner")
-
-CloseCorner.CornerRadius =
-    UDim.new(0, 9)
-
-CloseCorner.Parent = Close
+addCorner(Close, UDim.new(0, 9))
 
 
 --==============================================================
@@ -755,9 +578,7 @@ EggsTab.Font = Enum.Font.GothamBold
 EggsTab.TextSize = 12
 EggsTab.Parent = TabBar
 
-local EggsTabCorner = Instance.new("UICorner")
-EggsTabCorner.CornerRadius = UDim.new(0, 9)
-EggsTabCorner.Parent = EggsTab
+addCorner(EggsTab, UDim.new(0, 9))
 
 local SettingsTab = Instance.new("TextButton")
 SettingsTab.Size = UDim2.new(0.5, -4, 1, 0)
@@ -769,9 +590,7 @@ SettingsTab.Font = Enum.Font.GothamBold
 SettingsTab.TextSize = 12
 SettingsTab.Parent = TabBar
 
-local SettingsTabCorner = Instance.new("UICorner")
-SettingsTabCorner.CornerRadius = UDim.new(0, 9)
-SettingsTabCorner.Parent = SettingsTab
+addCorner(SettingsTab, UDim.new(0, 9))
 
 local EggsPage = Instance.new("Frame")
 EggsPage.Name = "EggsPage"
@@ -808,238 +627,71 @@ SettingsTab.MouseButton1Click:Connect(function() setActiveTab("Settings") end)
 -- CONTROL BUTTONS
 --==============================================================
 
-local GlobalToggle =
-    Instance.new("TextButton")
-
-GlobalToggle.Size =
-    UDim2.new(
-        0,
-        125,
-        0,
-        38
-    )
-
-GlobalToggle.Position =
-    UDim2.new(
-        0,
-        12,
-        0,
-        69
-    )
-
-GlobalToggle.BackgroundColor3 =
-    Color3.fromRGB(
-        60,
-        155,
-        95
-    )
-
-GlobalToggle.Text =
-    "ESP  |  ON"
-
-GlobalToggle.TextColor3 =
-    Color3.fromRGB(
-        255,
-        255,
-        255
-    )
-
-GlobalToggle.Font =
-    Enum.Font.GothamBold
-
+local GlobalToggle = Instance.new("TextButton")
+GlobalToggle.Size = UDim2.new(0, 125, 0, 38)
+GlobalToggle.Position = UDim2.new(0, 12, 0, 69)
+GlobalToggle.BackgroundColor3 = Color3.fromRGB(60, 155, 95)
+GlobalToggle.Text = "ESP  |  ON"
+GlobalToggle.TextColor3 = Color3.fromRGB(255, 255, 255)
+GlobalToggle.Font = Enum.Font.GothamBold
 GlobalToggle.TextSize = 12
-
 GlobalToggle.Parent = Main
 
 
-local GlobalCorner =
-    Instance.new("UICorner")
-
-GlobalCorner.CornerRadius =
-    UDim.new(0, 9)
-
-GlobalCorner.Parent = GlobalToggle
+addCorner(GlobalToggle, UDim.new(0, 9))
 
 
-local PlotTP =
-    Instance.new("TextButton")
-
-PlotTP.Size =
-    UDim2.new(
-        0,
-        140,
-        0,
-        38
-    )
-
-PlotTP.Position =
-    UDim2.new(
-        0,
-        145,
-        0,
-        69
-    )
-
-PlotTP.BackgroundColor3 =
-    Color3.fromRGB(
-        78,
-        100,
-        185
-    )
-
-PlotTP.Text =
-    "My Plot"
-
-PlotTP.TextColor3 =
-    Color3.fromRGB(
-        255,
-        255,
-        255
-    )
-
-PlotTP.Font =
-    Enum.Font.GothamBold
-
+local PlotTP = Instance.new("TextButton")
+PlotTP.Size = UDim2.new(0, 140, 0, 38)
+PlotTP.Position = UDim2.new(0, 145, 0, 69)
+PlotTP.BackgroundColor3 = Color3.fromRGB(78, 100, 185)
+PlotTP.Text = "My Plot"
+PlotTP.TextColor3 = Color3.fromRGB(255, 255, 255)
+PlotTP.Font = Enum.Font.GothamBold
 PlotTP.TextSize = 12
-
 PlotTP.Parent = Main
 
 
-local PlotTPCorner =
-    Instance.new("UICorner")
-
-PlotTPCorner.CornerRadius =
-    UDim.new(0, 9)
-
-PlotTPCorner.Parent = PlotTP
+addCorner(PlotTP, UDim.new(0, 9))
 
 
 --==============================================================
 -- SEARCH
 --==============================================================
 
-local SearchBox =
-    Instance.new("Frame")
-
-SearchBox.Size =
-    UDim2.new(
-        1,
-        -124,
-        0,
-        40
-    )
-
-SearchBox.Position =
-    UDim2.new(
-        0,
-        12,
-        0,
-        117
-    )
-
-SearchBox.BackgroundColor3 =
-    Color3.fromRGB(
-        32,
-        33,
-        43
-    )
-
+local SearchBox = Instance.new("Frame")
+SearchBox.Size = UDim2.new(1, -124, 0, 40)
+SearchBox.Position = UDim2.new(0, 12, 0, 117)
+SearchBox.BackgroundColor3 = Color3.fromRGB(32, 33, 43)
 SearchBox.BorderSizePixel = 0
-
 SearchBox.Parent = Main
 
 
-local SearchCorner =
-    Instance.new("UICorner")
-
-SearchCorner.CornerRadius =
-    UDim.new(0, 9)
-
-SearchCorner.Parent = SearchBox
+addCorner(SearchBox, UDim.new(0, 9))
 
 
-local SearchIcon =
-    Instance.new("TextLabel")
-
-SearchIcon.Size =
-    UDim2.new(
-        0,
-        35,
-        1,
-        0
-    )
-
+local SearchIcon = Instance.new("TextLabel")
+SearchIcon.Size = UDim2.new(0, 35, 1, 0)
 SearchIcon.BackgroundTransparency = 1
-
-SearchIcon.Text =
-    "S"
-
-SearchIcon.TextColor3 =
-    Color3.fromRGB(
-        155,
-        160,
-        180
-    )
-
-SearchIcon.Font =
-    Enum.Font.GothamBold
-
+SearchIcon.Text = "S"
+SearchIcon.TextColor3 = Color3.fromRGB(155, 160, 180)
+SearchIcon.Font = Enum.Font.GothamBold
 SearchIcon.TextSize = 20
-
 SearchIcon.Parent = SearchBox
 
 
-local Search =
-    Instance.new("TextBox")
-
-Search.Position =
-    UDim2.new(
-        0,
-        34,
-        0,
-        0
-    )
-
-Search.Size =
-    UDim2.new(
-        1,
-        -40,
-        1,
-        0
-    )
-
+local Search = Instance.new("TextBox")
+Search.Position = UDim2.new(0, 34, 0, 0)
+Search.Size = UDim2.new(1, -40, 1, 0)
 Search.BackgroundTransparency = 1
-
-Search.TextColor3 =
-    Color3.fromRGB(
-        240,
-        240,
-        248
-    )
-
-Search.PlaceholderColor3 =
-    Color3.fromRGB(
-        125,
-        128,
-        145
-    )
-
-Search.PlaceholderText =
-    "Search egg type..."
-
-Search.Text =
-    ""
-
+Search.TextColor3 = Color3.fromRGB(240, 240, 248)
+Search.PlaceholderColor3 = Color3.fromRGB(125, 128, 145)
+Search.PlaceholderText = "Search egg type..."
+Search.Text = ""
 Search.ClearTextOnFocus = false
-
-Search.Font =
-    Enum.Font.Gotham
-
+Search.Font = Enum.Font.Gotham
 Search.TextSize = 12
-
-Search.TextXAlignment =
-    Enum.TextXAlignment.Left
-
+Search.TextXAlignment = Enum.TextXAlignment.Left
 Search.Parent = SearchBox
 
 
@@ -1047,106 +699,39 @@ Search.Parent = SearchBox
 -- SCROLL LIST
 --==============================================================
 
-local List =
-    Instance.new("ScrollingFrame")
-
-List.Size =
-    UDim2.new(
-        1,
-        -24,
-        0,
-        328
-    )
-
-List.Position =
-    UDim2.new(
-        0,
-        12,
-        0,
-        165
-    )
-
-List.BackgroundColor3 =
-    Color3.fromRGB(
-        27,
-        28,
-        36
-    )
-
+local List = Instance.new("ScrollingFrame")
+List.Size = UDim2.new(1, -24, 0, 328)
+List.Position = UDim2.new(0, 12, 0, 165)
+List.BackgroundColor3 = Color3.fromRGB(27, 28, 36)
 List.BorderSizePixel = 0
 List.ClipsDescendants = true
-List.ScrollingDirection =
-    Enum.ScrollingDirection.Y
-
+List.ScrollingDirection = Enum.ScrollingDirection.Y
 List.ScrollBarThickness = 4
-
 List.ScrollBarImageTransparency = 0.25
-
-List.CanvasSize =
-    UDim2.new(
-        0,
-        0,
-        0,
-        0
-    )
-
-List.AutomaticCanvasSize =
-    Enum.AutomaticSize.None
-
+List.CanvasSize = UDim2.new(0, 0, 0, 0)
+List.AutomaticCanvasSize = Enum.AutomaticSize.None
 List.Parent = Main
 
 
-local ListCorner =
-    Instance.new("UICorner")
-
-ListCorner.CornerRadius =
-    UDim.new(0, 10)
-
-ListCorner.Parent = List
+addCorner(List, UDim.new(0, 10))
 
 
-local ListPadding =
-    Instance.new("UIPadding")
-
-ListPadding.PaddingTop =
-    UDim.new(0, 5)
-
-ListPadding.PaddingBottom =
-    UDim.new(0, 5)
-
-ListPadding.PaddingLeft =
-    UDim.new(0, 5)
-
-ListPadding.PaddingRight =
-    UDim.new(0, 5)
-
+local ListPadding = Instance.new("UIPadding")
+ListPadding.PaddingTop = UDim.new(0, 5)
+ListPadding.PaddingBottom = UDim.new(0, 5)
+ListPadding.PaddingLeft = UDim.new(0, 5)
+ListPadding.PaddingRight = UDim.new(0, 5)
 ListPadding.Parent = List
 
 
-local ListLayout =
-    Instance.new("UIListLayout")
-
-ListLayout.Padding =
-    UDim.new(0, 4)
-
-ListLayout.SortOrder =
-    Enum.SortOrder.LayoutOrder
-
+local ListLayout = Instance.new("UIListLayout")
+ListLayout.Padding = UDim.new(0, 4)
+ListLayout.SortOrder = Enum.SortOrder.LayoutOrder
 ListLayout.Parent = List
 
 
-ListLayout:GetPropertyChangedSignal(
-    "AbsoluteContentSize"
-):Connect(function()
-
-    List.CanvasSize =
-        UDim2.new(
-            0,
-            0,
-            0,
-            ListLayout.AbsoluteContentSize.Y + 12
-        )
-
+ListLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+    List.CanvasSize = UDim2.new(0, 0, 0, ListLayout.AbsoluteContentSize.Y + 12)
 end)
 
 
@@ -1154,78 +739,27 @@ end)
 -- STATUS
 --==============================================================
 
-local Status =
-    Instance.new("TextLabel")
-
-Status.Size =
-    UDim2.new(
-        1,
-        -24,
-        0,
-        40
-    )
-
-Status.Position =
-    UDim2.new(
-        0,
-        12,
-        0,
-        508
-    )
-
-Status.BackgroundColor3 =
-    Color3.fromRGB(
-        29,
-        30,
-        39
-    )
-
-Status.Font =
-    Enum.Font.Gotham
-
+local Status = Instance.new("TextLabel")
+Status.Size = UDim2.new(1, -24, 0, 40)
+Status.Position = UDim2.new(0, 12, 0, 508)
+Status.BackgroundColor3 = Color3.fromRGB(29, 30, 39)
+Status.Font = Enum.Font.Gotham
 Status.TextSize = 12
-
-Status.TextTruncate =
-    Enum.TextTruncate.AtEnd
-
-Status.TextYAlignment =
-    Enum.TextYAlignment.Center
-
-Status.TextColor3 =
-    Color3.fromRGB(
-        145,
-        149,
-        165
-    )
-
-Status.TextXAlignment =
-    Enum.TextXAlignment.Left
-
-Status.Text =
-    ""
-
+Status.TextTruncate = Enum.TextTruncate.AtEnd
+Status.TextYAlignment = Enum.TextYAlignment.Center
+Status.TextColor3 = Color3.fromRGB(145, 149, 165)
+Status.TextXAlignment = Enum.TextXAlignment.Left
+Status.Text = ""
 Status.Parent = Main
 Status.Visible = false
 
 
-local StatusCorner =
-    Instance.new("UICorner")
-
-StatusCorner.CornerRadius =
-    UDim.new(0, 8)
-
-StatusCorner.Parent = Status
+addCorner(Status, UDim.new(0, 8))
 
 
-local StatusPadding =
-    Instance.new("UIPadding")
-
-StatusPadding.PaddingLeft =
-    UDim.new(0, 10)
-
-StatusPadding.PaddingRight =
-    UDim.new(0, 10)
-
+local StatusPadding = Instance.new("UIPadding")
+StatusPadding.PaddingLeft = UDim.new(0, 10)
+StatusPadding.PaddingRight = UDim.new(0, 10)
 StatusPadding.Parent = Status
 
 -- Move existing controls into the Eggs page.
@@ -1252,12 +786,8 @@ FlyStateLabel.Font = Enum.Font.Gotham
 FlyStateLabel.TextSize = 11
 FlyStateLabel.TextXAlignment = Enum.TextXAlignment.Left
 FlyStateLabel.Parent = SettingsPage
-local FlyStatePadding = Instance.new("UIPadding")
-FlyStatePadding.PaddingLeft = UDim.new(0,10)
-FlyStatePadding.Parent = FlyStateLabel
-local FlyStateCorner = Instance.new("UICorner")
-FlyStateCorner.CornerRadius = UDim.new(0,8)
-FlyStateCorner.Parent = FlyStateLabel
+addPadding(FlyStateLabel, 10)
+addCorner(FlyStateLabel, UDim.new(0,8))
 
 local SpeedLabel = Instance.new("TextLabel")
 SpeedLabel.Size = UDim2.new(1,0,0,28)
@@ -1275,18 +805,14 @@ SpeedBar.Size = UDim2.new(1,0,0,14)
 SpeedBar.BackgroundColor3 = Color3.fromRGB(45,46,58)
 SpeedBar.LayoutOrder = 4
 SpeedBar.Parent = SettingsPage
-local SpeedBarCorner = Instance.new("UICorner")
-SpeedBarCorner.CornerRadius = UDim.new(1,0)
-SpeedBarCorner.Parent = SpeedBar
+addCorner(SpeedBar, UDim.new(1,0))
 
 local SpeedFill = Instance.new("Frame")
 SpeedFill.Size = UDim2.new((FlySpeed-MIN_FLY_SPEED)/(MAX_FLY_SPEED-MIN_FLY_SPEED),0,1,0)
 SpeedFill.BackgroundColor3 = Color3.fromRGB(90,120,235)
 SpeedFill.BorderSizePixel = 0
 SpeedFill.Parent = SpeedBar
-local SpeedFillCorner = Instance.new("UICorner")
-SpeedFillCorner.CornerRadius = UDim.new(1,0)
-SpeedFillCorner.Parent = SpeedFill
+addCorner(SpeedFill, UDim.new(1,0))
 
 local SpeedHit = Instance.new("TextButton")
 SpeedHit.Size = UDim2.new(1,0,1,0)
@@ -1332,12 +858,8 @@ ReturnLabel.TextSize = 11
 ReturnLabel.TextXAlignment = Enum.TextXAlignment.Left
 ReturnLabel.LayoutOrder = 5
 ReturnLabel.Parent = SettingsPage
-local ReturnPadding = Instance.new("UIPadding")
-ReturnPadding.PaddingLeft = UDim.new(0,10)
-ReturnPadding.Parent = ReturnLabel
-local ReturnCorner = Instance.new("UICorner")
-ReturnCorner.CornerRadius = UDim.new(0,8)
-ReturnCorner.Parent = ReturnLabel
+addPadding(ReturnLabel, 10)
+addCorner(ReturnLabel, UDim.new(0,8))
 
 local DisplayTitle = Instance.new("TextButton")
 DisplayTitle.Size = UDim2.new(1,0,0,34)
@@ -1349,21 +871,15 @@ DisplayTitle.TextSize = 12
 DisplayTitle.TextXAlignment = Enum.TextXAlignment.Left
 DisplayTitle.AutoButtonColor = false
 DisplayTitle.Parent = SettingsPage
-local DisplayTitlePadding = Instance.new("UIPadding")
-DisplayTitlePadding.PaddingLeft = UDim.new(0,10)
-DisplayTitlePadding.Parent = DisplayTitle
-local DisplayTitleCorner = Instance.new("UICorner")
-DisplayTitleCorner.CornerRadius = UDim.new(0,8)
-DisplayTitleCorner.Parent = DisplayTitle
+addPadding(DisplayTitle, 10)
+addCorner(DisplayTitle, UDim.new(0,8))
 
 local DisplayFrame = Instance.new("Frame")
 DisplayFrame.Size = UDim2.new(1,0,0,102)
 DisplayFrame.BackgroundColor3 = Color3.fromRGB(29,30,39)
 DisplayFrame.Visible = false
 DisplayFrame.Parent = SettingsPage
-local DisplayFrameCorner = Instance.new("UICorner")
-DisplayFrameCorner.CornerRadius = UDim.new(0,9)
-DisplayFrameCorner.Parent = DisplayFrame
+addCorner(DisplayFrame, UDim.new(0,9))
 local DisplayLayout = Instance.new("UIListLayout")
 DisplayLayout.Padding = UDim.new(0,5)
 DisplayLayout.Parent = DisplayFrame
@@ -1427,12 +943,8 @@ RarityTitle.TextXAlignment = Enum.TextXAlignment.Left
 RarityTitle.LayoutOrder = 6
 RarityTitle.AutoButtonColor = false
 RarityTitle.Parent = SettingsPage
-local RarityTitlePadding = Instance.new("UIPadding")
-RarityTitlePadding.PaddingLeft = UDim.new(0,10)
-RarityTitlePadding.Parent = RarityTitle
-local RarityTitleCorner = Instance.new("UICorner")
-RarityTitleCorner.CornerRadius = UDim.new(0,8)
-RarityTitleCorner.Parent = RarityTitle
+addPadding(RarityTitle, 10)
+addCorner(RarityTitle, UDim.new(0,8))
 
 local RarityFrame = Instance.new("Frame")
 RarityFrame.Size = UDim2.new(1,0,0,180)
@@ -1440,9 +952,7 @@ RarityFrame.BackgroundColor3 = Color3.fromRGB(29,30,39)
 RarityFrame.LayoutOrder = 7
 RarityFrame.Visible = false
 RarityFrame.Parent = SettingsPage
-local RarityFrameCorner = Instance.new("UICorner")
-RarityFrameCorner.CornerRadius = UDim.new(0,9)
-RarityFrameCorner.Parent = RarityFrame
+addCorner(RarityFrame, UDim.new(0,9))
 local RarityGrid = Instance.new("UIGridLayout")
 RarityGrid.CellSize = UDim2.new(0.5,-6,0,28)
 RarityGrid.CellPadding = UDim2.new(0,6,0,5)
@@ -1513,9 +1023,7 @@ AutoReturnButton.Font = Enum.Font.GothamBold
 AutoReturnButton.TextSize = 11
 AutoReturnButton.LayoutOrder = 8
 AutoReturnButton.Parent = SettingsPage
-local AutoReturnCorner = Instance.new("UICorner")
-AutoReturnCorner.CornerRadius = UDim.new(0,8)
-AutoReturnCorner.Parent = AutoReturnButton
+addCorner(AutoReturnButton, UDim.new(0,8))
 
 local SuperOptimizeButton = Instance.new("TextButton")
 SuperOptimizeButton.Size = UDim2.new(1,0,0,34)
@@ -1525,9 +1033,7 @@ SuperOptimizeButton.TextColor3 = Color3.fromRGB(255,255,255)
 SuperOptimizeButton.Font = Enum.Font.GothamBold
 SuperOptimizeButton.TextSize = 11
 SuperOptimizeButton.Parent = SettingsPage
-local SuperOptimizeCorner = Instance.new("UICorner")
-SuperOptimizeCorner.CornerRadius = UDim.new(0,8)
-SuperOptimizeCorner.Parent = SuperOptimizeButton
+addCorner(SuperOptimizeButton, UDim.new(0,8))
 
 SuperOptimizeButton.MouseButton1Click:Connect(function()
     if setSuperOptimization then
@@ -1558,102 +1064,58 @@ AutoFarmToggle.Font = Enum.Font.GothamBold
 AutoFarmToggle.TextSize = 11
 AutoFarmToggle.AutoButtonColor = false
 AutoFarmToggle.Parent = SettingsPage
-local AutoFarmToggleCorner = Instance.new("UICorner")
-AutoFarmToggleCorner.CornerRadius = UDim.new(0,8)
-AutoFarmToggleCorner.Parent = AutoFarmToggle
-
-local AutoFarmModeButton = Instance.new("TextButton")
-AutoFarmModeButton.Size = UDim2.new(1,0,0,34)
-AutoFarmModeButton.BackgroundColor3 = Color3.fromRGB(72,155,105)
-AutoFarmModeButton.Text = "MODE: TP"
-AutoFarmModeButton.TextColor3 = Color3.fromRGB(230,232,242)
-AutoFarmModeButton.Font = Enum.Font.GothamBold
-AutoFarmModeButton.TextSize = 11
-AutoFarmModeButton.AutoButtonColor = false
-AutoFarmModeButton.Parent = SettingsPage
-local AutoFarmModeCorner = Instance.new("UICorner")
-AutoFarmModeCorner.CornerRadius = UDim.new(0,8)
-AutoFarmModeCorner.Parent = AutoFarmModeButton
+addCorner(AutoFarmToggle, UDim.new(0,8))
 
 local AutoFarmTargetButton = Instance.new("TextButton")
 AutoFarmTargetButton.Size = UDim2.new(1,0,0,34)
 AutoFarmTargetButton.BackgroundColor3 = Color3.fromRGB(48,50,65)
-AutoFarmTargetButton.Text = "RARITY: ALL  [click for list]"
+AutoFarmTargetButton.Text = "AUTO FARM RARITY"
 AutoFarmTargetButton.TextColor3 = Color3.fromRGB(230,232,242)
 AutoFarmTargetButton.Font = Enum.Font.GothamBold
 AutoFarmTargetButton.TextSize = 11
 AutoFarmTargetButton.TextXAlignment = Enum.TextXAlignment.Left
 AutoFarmTargetButton.AutoButtonColor = false
 AutoFarmTargetButton.Parent = SettingsPage
-local AutoFarmTargetPadding = Instance.new("UIPadding")
-AutoFarmTargetPadding.PaddingLeft = UDim.new(0,10)
-AutoFarmTargetPadding.Parent = AutoFarmTargetButton
-local AutoFarmTargetCorner = Instance.new("UICorner")
-AutoFarmTargetCorner.CornerRadius = UDim.new(0,8)
-AutoFarmTargetCorner.Parent = AutoFarmTargetButton
+addPadding(AutoFarmTargetButton, 10)
+addCorner(AutoFarmTargetButton, UDim.new(0,8))
 
-local AutoFarmList = Instance.new("ScrollingFrame")
-AutoFarmList.Size = UDim2.new(1,0,0,150)
-AutoFarmList.BackgroundColor3 = Color3.fromRGB(29,30,39)
+local AutoFarmList = Instance.new("Frame")
+AutoFarmList.Size = UDim2.new(1,0,0,0)
+AutoFarmList.BackgroundTransparency = 1
 AutoFarmList.BorderSizePixel = 0
-AutoFarmList.ScrollBarThickness = 4
-AutoFarmList.CanvasSize = UDim2.new(0,0,0,0)
-AutoFarmList.Visible = false
+AutoFarmList.Visible = true
 AutoFarmList.Parent = SettingsPage
-local AutoFarmListCorner = Instance.new("UICorner")
-AutoFarmListCorner.CornerRadius = UDim.new(0,9)
-AutoFarmListCorner.Parent = AutoFarmList
 local AutoFarmListLayout = Instance.new("UIListLayout")
 AutoFarmListLayout.Padding = UDim.new(0,4)
 AutoFarmListLayout.SortOrder = Enum.SortOrder.LayoutOrder
 AutoFarmListLayout.Parent = AutoFarmList
-local AutoFarmListPad = Instance.new("UIPadding")
-AutoFarmListPad.PaddingTop = UDim.new(0,6)
-AutoFarmListPad.PaddingLeft = UDim.new(0,6)
-AutoFarmListPad.PaddingRight = UDim.new(0,6)
-AutoFarmListPad.Parent = AutoFarmList
-AutoFarmListLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-    AutoFarmList.CanvasSize = UDim2.new(0,0,0,AutoFarmListLayout.AbsoluteContentSize.Y + 12)
-end)
 
 local AutoFarmListOpen = false
 local AutoFarmRows = {}
-
-local function getAutoFarmTargetState(name)
-    return AutoFarmTargets[string.lower(tostring(name))] == true
-end
 
 local function refreshAutoFarmTargetButton()
     local count = 0
     for _ in pairs(AutoFarmTargets) do count += 1 end
 
     if AutoFarmTargetAll then
-        AutoFarmTargetButton.Text = "RARITY: ALL  [click for list]"
+        AutoFarmTargetButton.Text = "AUTO FARM RARITY: ALL"
     elseif count == 0 then
-        AutoFarmTargetButton.Text = "RARITY: NONE  [click for list]"
+        AutoFarmTargetButton.Text = "AUTO FARM RARITY: NONE"
     elseif count == 1 then
         for key in pairs(AutoFarmTargets) do
-            AutoFarmTargetButton.Text = "RARITY: " .. tostring(key) .. "  [list]"
+            AutoFarmTargetButton.Text = "AUTO FARM RARITY: " .. tostring(key)
             break
         end
     else
-        AutoFarmTargetButton.Text = "RARITY: " .. tostring(count) .. " TYPES  [list]"
+        AutoFarmTargetButton.Text = "AUTO FARM RARITY: " .. tostring(count) .. " TYPES"
     end
 end
 
 local function refreshAutoFarmRows()
-    -- Auto Farm chọn theo ĐỘ HIẾM, không chọn từng egg.
     local names = {}
-
     for _, rarityInfo in ipairs(RARITY_CONFIG) do
         table.insert(names, tostring(rarityInfo.Name))
     end
-
-    table.sort(names, function(a, b)
-        local ra = RarityByName[string.lower(a)]
-        local rb = RarityByName[string.lower(b)]
-        return (ra and ra.Order or 999) < (rb and rb.Order or 999)
-    end)
 
     for key, row in pairs(AutoFarmRows) do
         local found = false
@@ -1700,79 +1162,39 @@ local function refreshAutoFarmRows()
         end
 
         local row = AutoFarmRows[key]
-        local on = AutoFarmTargetAll or getAutoFarmTargetState(name)
+        local on = AutoFarmTargetAll or AutoFarmTargets[key] == true
         row.Text = (on and "[ON] " or "[OFF] ") .. name
         row.BackgroundColor3 = on
             and Color3.fromRGB(48,50,65)
             or Color3.fromRGB(34,35,44)
     end
-end
 
-local function setAutoFarmListOpen(open)
-    AutoFarmListOpen = open == true
+    AutoFarmList.Size = UDim2.new(1, 0, 0, #names * 32 + 6)
     AutoFarmList.Visible = AutoFarmListOpen
-    AutoFarmTargetButton.TextColor3 = AutoFarmListOpen
-        and Color3.fromRGB(255,255,255)
-        or Color3.fromRGB(230,232,242)
-
-    if AutoFarmListOpen then
-        refreshAutoFarmRows()
-    end
-
-    if relayoutSettings then
-        relayoutSettings()
-    end
 end
+
+refreshAutoFarmRows()
+refreshAutoFarmTargetButton()
 
 AutoFarmTargetButton.MouseButton1Click:Connect(function()
-    setAutoFarmListOpen(not AutoFarmListOpen)
-end)
-
-AutoFarmModeButton.MouseButton1Click:Connect(function()
-    AutoFarmMode = AutoFarmMode == "TP" and "Fly" or "TP"
-    AutoFarmModeButton.Text = AutoFarmMode == "TP"
-        and "MODE: TP"
-        or "MODE: FLY"
-    AutoFarmModeButton.BackgroundColor3 = AutoFarmMode == "TP"
-        and Color3.fromRGB(72,155,105)
-        or Color3.fromRGB(77,97,175)
+    AutoFarmListOpen = not AutoFarmListOpen
+    AutoFarmList.Visible = AutoFarmListOpen
+    relayoutSettings()
 end)
 
 AutoFarmToggle.MouseButton1Click:Connect(function()
     AutoFarmEnabled = not AutoFarmEnabled
-
-    AutoFarmToggle.Text = AutoFarmEnabled
-        and "AUTO FARM: ON"
-        or "AUTO FARM: OFF"
-
-    AutoFarmToggle.BackgroundColor3 = AutoFarmEnabled
-        and Color3.fromRGB(60,145,90)
-        or Color3.fromRGB(145,65,75)
+    AutoFarmToken += 1
 
     if AutoFarmEnabled then
-        refreshAutoFarmRows()
-        showStatus("Auto Farm " .. AutoFarmMode .. " started", 2)
+        AutoFarmToggle.Text = "AUTO FARM: ON"
+        AutoFarmToggle.BackgroundColor3 = Color3.fromRGB(60,145,90)
         task.spawn(runAutoFarm)
     else
-        AutoFarmToken += 1
-        if FlyBusy then
-            FlyCancelToken += 1
-            FlyBusy = false
-        end
-        showStatus("Auto Farm stopped", 1.5)
+        AutoFarmToggle.Text = "AUTO FARM: OFF"
+        AutoFarmToggle.BackgroundColor3 = Color3.fromRGB(145,65,75)
     end
 end)
-
--- Right click = select every egg type.
-AutoFarmTargetButton.MouseButton2Click:Connect(function()
-    AutoFarmTargetAll = true
-    AutoFarmTargets = {}
-    refreshAutoFarmRows()
-    refreshAutoFarmTargetButton()
-end)
-
-refreshAutoFarmRows()
-refreshAutoFarmTargetButton()
 
 -- Responsive settings layout. Sections push the controls below them
 -- instead of overlapping when a dropdown is opened.
@@ -1830,13 +1252,15 @@ relayoutSettings = function()
     y += 28 + 4
     AutoFarmToggle.Position = UDim2.new(0, 0, 0, y)
     y += 34 + 5
-    AutoFarmModeButton.Position = UDim2.new(0, 0, 0, y)
-    y += 34 + 5
     AutoFarmTargetButton.Position = UDim2.new(0, 0, 0, y)
     y += 34 + 5
     AutoFarmList.Position = UDim2.new(0, 0, 0, y)
     AutoFarmList.Visible = AutoFarmListOpen
-    if AutoFarmListOpen then y += 150 + 8 else y += 8 end
+    if AutoFarmListOpen then
+        y += AutoFarmList.Size.Y.Offset + 8
+    else
+        y += 8
+    end
 
     SettingsPage.CanvasSize = UDim2.new(0, 0, 0, y)
 end
@@ -1850,7 +1274,6 @@ AutoReturnButton.MouseButton1Click:Connect(function()
     ReturnLabel.Text = "Auto return to My Plot after reaching an egg: " .. (FlyToPlotAfterEgg and "ON" or "OFF")
 end)
 
-SettingsPage.CanvasSize = UDim2.new(0,0,0,460)
 
 
 local StatusExpiresAt = 0
@@ -1882,18 +1305,12 @@ TopBar.InputBegan:Connect(function(input)
         return
     end
 
-    if input.UserInputType ==
-        Enum.UserInputType.MouseButton1
-        or input.UserInputType ==
-        Enum.UserInputType.Touch then
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
 
         dragging = true
-
-        dragStart =
-            input.Position
-
-        startPosition =
-            Main.Position
+        dragStart = input.Position
+        startPosition = Main.Position
 
     end
 
@@ -1902,10 +1319,8 @@ end)
 
 TopBar.InputEnded:Connect(function(input)
 
-    if input.UserInputType ==
-        Enum.UserInputType.MouseButton1
-        or input.UserInputType ==
-        Enum.UserInputType.Touch then
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
 
         dragging = false
 
@@ -1940,64 +1355,51 @@ end)
 
 
 Connections.InputChanged =
-    UserInputService.InputChanged:Connect(
-        function(input)
+    UserInputService.InputChanged:Connect(function(input)
 
-            if MainMinimized or (not dragging and not resizing) then
-
-                return
-            end
-
-            if input.UserInputType ~=
-                Enum.UserInputType.MouseMovement
-                and input.UserInputType ~=
-                Enum.UserInputType.Touch then
-
-                return
-
-            end
-
-
-            if dragging then
-                local delta =
-                    input.Position - dragStart
-
-                Main.Position =
-                    UDim2.new(
-                        startPosition.X.Scale,
-                        startPosition.X.Offset
-                            + delta.X,
-
-                        startPosition.Y.Scale,
-                        startPosition.Y.Offset
-                            + delta.Y
-                    )
-
-                return
-            end
-
-
-            local delta =
-                (input.Position - resizeStart) / resizeScale
-
-            local width = math.clamp(
-                resizeStartSize.X.Offset + delta.X,
-                MIN_MENU_WIDTH,
-                MAX_MENU_WIDTH
-            )
-
-            local height = math.clamp(
-                resizeStartSize.Y.Offset + delta.Y,
-                MIN_MENU_HEIGHT,
-                MAX_MENU_HEIGHT
-            )
-
-            Main.Size = UDim2.new(0, width, 0, height)
-            MainExpandedSize = Main.Size
-            updateMainScale()
-
+        if MainMinimized or (not dragging and not resizing) then
+            return
         end
-    )
+
+        if input.UserInputType ~= Enum.UserInputType.MouseMovement
+            and input.UserInputType ~= Enum.UserInputType.Touch then
+            return
+        end
+
+
+        if dragging then
+            local delta = input.Position - dragStart
+
+            Main.Position = UDim2.new(
+                startPosition.X.Scale,
+                startPosition.X.Offset + delta.X,
+                startPosition.Y.Scale,
+                startPosition.Y.Offset + delta.Y
+            )
+
+            return
+        end
+
+
+        local delta = (input.Position - resizeStart) / resizeScale
+
+        local width = math.clamp(
+            resizeStartSize.X.Offset + delta.X,
+            MIN_MENU_WIDTH,
+            MAX_MENU_WIDTH
+        )
+
+        local height = math.clamp(
+            resizeStartSize.Y.Offset + delta.Y,
+            MIN_MENU_HEIGHT,
+            MAX_MENU_HEIGHT
+        )
+
+        Main.Size = UDim2.new(0, width, 0, height)
+        MainExpandedSize = Main.Size
+        updateMainScale()
+
+    end)
 
 
 --==============================================================
@@ -2093,8 +1495,7 @@ local function createESP(model)
     end
 
 
-    local root =
-        getRootPart(model)
+    local root = getRootPart(model)
 
 
     if not root then
@@ -2105,69 +1506,26 @@ local function createESP(model)
     local rarityColor = rarityInfo and rarityInfo.Color or Color3.fromRGB(220, 220, 230)
 
 
-    local billboard =
-        Instance.new("BillboardGui")
-
-    billboard.Name =
-        "EggESP"
-
-    billboard.Adornee =
-        root
-
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "EggESP"
+    billboard.Adornee = root
     billboard.AlwaysOnTop = true
-
-    billboard.Size =
-        UDim2.new(
-            0,
-            190,
-            0,
-            44
-        )
-
-    billboard.StudsOffset =
-        Vector3.new(
-            0,
-            2.5,
-            0
-        )
-
-    billboard.Enabled =
-        GlobalESPEnabled
-        and getEggTypeEnabled(model)
-
-    billboard.Parent =
-        root
+    billboard.Size = UDim2.new(0, 190, 0, 44)
+    billboard.StudsOffset = Vector3.new(0, 2.5, 0)
+    billboard.Enabled = GlobalESPEnabled and getEggTypeEnabled(model)
+    billboard.Parent = root
 
 
-    local label =
-        Instance.new("TextLabel")
-
-    label.Name =
-        "Info"
-
-    label.Size =
-        UDim2.fromScale(
-            1,
-            1
-        )
-
+    local label = Instance.new("TextLabel")
+    label.Name = "Info"
+    label.Size = UDim2.fromScale(1, 1)
     label.BackgroundTransparency = 1
-
-    label.Font =
-        Enum.Font.GothamBold
-
+    label.Font = Enum.Font.GothamBold
     label.TextSize = 13
-
     label.TextColor3 = rarityColor
-
-    label.TextStrokeTransparency =
-        0.15
-
-    label.Text =
-        getESPDisplayText(model, rarityInfo)
-
-    label.Parent =
-        billboard
+    label.TextStrokeTransparency = 0.15
+    label.Text = getESPDisplayText(model, rarityInfo)
+    label.Parent = billboard
 
 
     local highlight = nil
@@ -2175,30 +1533,15 @@ local function createESP(model)
 
     if SHOW_HIGHLIGHT then
 
-        highlight =
-            Instance.new("Highlight")
-
-        highlight.Name =
-            "EggHighlight"
-
+        highlight = Instance.new("Highlight")
+        highlight.Name = "EggHighlight"
         highlight.FillColor = rarityColor
         highlight.OutlineColor = rarityColor
-
-        highlight.FillTransparency =
-            0.78
-
-        highlight.OutlineTransparency =
-            0.1
-
-        highlight.Adornee =
-            model
-
-        highlight.Enabled =
-            GlobalESPEnabled
-            and getEggTypeEnabled(model)
-
-        highlight.Parent =
-            model
+        highlight.FillTransparency = 0.78
+        highlight.OutlineTransparency = 0.1
+        highlight.Adornee = model
+        highlight.Enabled = GlobalESPEnabled and getEggTypeEnabled(model)
+        highlight.Parent = model
 
     end
 
@@ -2218,8 +1561,7 @@ end
 
 local function destroyESP(model)
 
-    local esp =
-        ESPs[model]
+    local esp = ESPs[model]
 
     if not esp then
         return
@@ -2296,134 +1638,58 @@ local function createEggGroup(groupName)
 
 
     local group = {
-
         Eggs = {},
-
         Expanded = true,
-
         Rarity = nil,
-
         RarityOrder = #RARITY_CONFIG + 100,
-
         RarityColor = Color3.fromRGB(190, 195, 205),
-
         GroupFrame = nil,
-
         Container = nil
-
     }
 
 
     -- Each Egg group gets one wrapper so the header and its contents
     -- stay together when UIListLayout sorts the scrolling list.
-    local GroupFrame =
-        Instance.new("Frame")
-
-    GroupFrame.Name =
-        "Group_" .. groupName
-
-    GroupFrame.Size =
-        UDim2.new(
-            1,
-            -2,
-            0,
-            34
-        )
-
+    local GroupFrame = Instance.new("Frame")
+    GroupFrame.Name = "Group_" .. groupName
+    GroupFrame.Size = UDim2.new(1, -2, 0, 34)
     GroupFrame.BackgroundTransparency = 1
-
-    GroupFrame.AutomaticSize =
-        Enum.AutomaticSize.Y
-
+    GroupFrame.AutomaticSize = Enum.AutomaticSize.Y
     GroupFrame.Parent = List
 
-    local GroupLayout =
-        Instance.new("UIListLayout")
-
-    GroupLayout.Padding =
-        UDim.new(0, 2)
-
-    GroupLayout.SortOrder =
-        Enum.SortOrder.LayoutOrder
-
+    local GroupLayout = Instance.new("UIListLayout")
+    GroupLayout.Padding = UDim.new(0, 2)
+    GroupLayout.SortOrder = Enum.SortOrder.LayoutOrder
     GroupLayout.Parent = GroupFrame
 
-    local Header =
-        Instance.new("Frame")
-
-    Header.Name =
-        "Header"
-
-    Header.Size =
-        UDim2.new(
-            1,
-            -2,
-            0,
-            34
-        )
-
-    Header.BackgroundColor3 =
-        Color3.fromRGB(
-            41,
-            42,
-            54
-        )
-
+    local Header = Instance.new("Frame")
+    Header.Name = "Header"
+    Header.Size = UDim2.new(1, -2, 0, 34)
+    Header.BackgroundColor3 = Color3.fromRGB(41, 42, 54)
     Header.BorderSizePixel = 0
-
     Header.LayoutOrder = 1
     Header.Parent = GroupFrame
 
 
-    local HeaderCorner =
-        Instance.new("UICorner")
-
-    HeaderCorner.CornerRadius =
-        UDim.new(0, 7)
-
-    HeaderCorner.Parent =
-        Header
+    local HeaderCorner = Instance.new("UICorner")
+    HeaderCorner.CornerRadius = UDim.new(0, 7)
+    HeaderCorner.Parent = Header
 
 
-    local Toggle =
-        Instance.new("TextButton")
-
-    Toggle.Size =
-        UDim2.new(
-            1,
-            -160,
-            1,
-            0
-        )
-
+    local Toggle = Instance.new("TextButton")
+    Toggle.Size = UDim2.new(1, -160, 1, 0)
     Toggle.BackgroundTransparency = 1
-
-    Toggle.TextXAlignment =
-        Enum.TextXAlignment.Left
-
-    Toggle.Font =
-        Enum.Font.GothamBold
-
+    Toggle.TextXAlignment = Enum.TextXAlignment.Left
+    Toggle.Font = Enum.Font.GothamBold
     Toggle.TextSize = 12
-
-    Toggle.TextTruncate =
-        Enum.TextTruncate.AtEnd
-
-    Toggle.TextColor3 =
-        Color3.fromRGB(
-            235,
-            237,
-            248
-        )
+    Toggle.TextTruncate = Enum.TextTruncate.AtEnd
+    Toggle.TextColor3 = Color3.fromRGB(235, 237, 248)
 
     local rarity = group.Rarity
     local rarityInfo = getRarityInfo(rarity)
 
-    Toggle.Text =
-        "v  " .. groupName
-
-    Toggle.Parent =
-        Header
+    Toggle.Text = "v  " .. groupName
+    Toggle.Parent = Header
 
     local RarityLabel = Instance.new("TextLabel")
     RarityLabel.Name = "Rarity"
@@ -2439,80 +1705,41 @@ local function createEggGroup(groupName)
     RarityLabel.Parent = Header
 
 
-    local Container =
-        Instance.new("Frame")
-
-    Container.Name =
-        "Container"
-
-    Container.Size =
-        UDim2.new(
-            1,
-            -2,
-            0,
-            0
-        )
-
+    local Container = Instance.new("Frame")
+    Container.Name = "Container"
+    Container.Size = UDim2.new(1, -2, 0, 0)
     Container.BackgroundTransparency = 1
-
-    Container.AutomaticSize =
-        Enum.AutomaticSize.Y
-
+    Container.AutomaticSize = Enum.AutomaticSize.Y
     Container.Visible = true
-
     Container.LayoutOrder = 2
-    Container.Parent =
-        GroupFrame
+    Container.Parent = GroupFrame
 
 
-    local ContainerLayout =
-        Instance.new("UIListLayout")
-
-    ContainerLayout.Padding =
-        UDim.new(0, 2)
-
-    ContainerLayout.Parent =
-        Container
+    local ContainerLayout = Instance.new("UIListLayout")
+    ContainerLayout.Padding = UDim.new(0, 2)
+    ContainerLayout.Parent = Container
 
 
-    group.GroupFrame =
-        GroupFrame
-
-    group.Container =
-        Container
+    group.GroupFrame = GroupFrame
+    group.Container = Container
 
 
-    EggGroups[groupName] =
-        group
+    EggGroups[groupName] = group
 
 
-    Toggle.MouseButton1Click:Connect(
-        function()
+    Toggle.MouseButton1Click:Connect(function()
 
-            group.Expanded =
-                not group.Expanded
+        group.Expanded = not group.Expanded
+        Container.Visible = group.Expanded
+        GroupFrame.AutomaticSize = Enum.AutomaticSize.Y
 
-            Container.Visible =
-                group.Expanded
-
-            GroupFrame.AutomaticSize =
-                Enum.AutomaticSize.Y
-
-            if group.Expanded then
-
-                Toggle.Text =
-                    "v  " .. groupName
-
-            else
-
-                Toggle.Text =
-                    ">  " .. groupName
-
-            end
-
+        if group.Expanded then
+            Toggle.Text = "v  " .. groupName
+        else
+            Toggle.Text = ">  " .. groupName
         end
-    )
 
+    end)
 
 
     return group
@@ -2670,6 +1897,9 @@ flyToTarget = function(model, afterEgg)
     if FlyBusy then
         return false, "Fly is busy"
     end
+
+    model = resolveEggModel(model)
+
     if not model or not model.Parent or not model:IsDescendantOf(RenderedEggs) then
         return false, "Egg no longer exists"
     end
@@ -2680,7 +1910,8 @@ flyToTarget = function(model, afterEgg)
     end
 
     local eggTarget = getEggTopCFrame(model)
-    if not eggTarget then
+    local hoverPosition = getEggHoverPosition(model)
+    if not eggTarget or not hoverPosition then
         return false, "Egg is not ready"
     end
 
@@ -2711,11 +1942,11 @@ flyToTarget = function(model, afterEgg)
 
     if not isVolcanic then
         -- Other eggs: no pathfinding, no obstacle checks, just noclip direct flight.
-        success = flySegment(eggTarget.Position + Vector3.new(0, FlyHeight, 0), token)
+        success = flySegment(hoverPosition, token)
     else
         -- Volcanic Egg: pathfinding is mandatory.
         local eggRoot = getRootPart(model)
-        local navigationTarget = eggRoot and (eggRoot.Position + Vector3.new(0, 2, 0)) or eggTarget.Position
+        local navigationTarget = eggRoot and (eggRoot.Position + Vector3.new(0, 2, 0)) or hoverPosition
         local waypoints = getPathWaypoints(RootPart.Position, navigationTarget)
 
         if not waypoints then
@@ -2745,7 +1976,7 @@ flyToTarget = function(model, afterEgg)
             previousPosition = waypointPosition
         end
 
-        local finalTarget = eggTarget.Position + Vector3.new(0, FlyHeight, 0)
+        local finalTarget = hoverPosition
         if not isPathSegmentClear(RootPart.Position, finalTarget, Character) then
             showStatus("Volcanic Egg: final route blocked", 2)
             return finish(false, "Volcanic final route blocked")
@@ -2761,6 +1992,16 @@ flyToTarget = function(model, afterEgg)
             showStatus("Could not reach " .. model.Name, 2)
         end
         return finish(false, "Could not reach egg")
+    end
+
+    -- Tới nơi xong thì kích hoạt Pickup ProximityPrompt ngay.
+    if model.Parent and model:IsDescendantOf(RenderedEggs) then
+        local picked, how = instantPickupEgg(model)
+        if picked then
+            showStatus("Pickup -> " .. model.Name, 0.7)
+        else
+            showStatus("Pickup failed: " .. tostring(how), 2)
+        end
     end
 
     if afterEgg and FlyToPlotAfterEgg and token == FlyCancelToken then
@@ -2821,10 +2062,7 @@ local function createEggEntry(model)
     end
 
 
-    local group =
-        createEggGroup(
-            model.Name
-        )
+    local group = createEggGroup(model.Name)
 
 
     group.Eggs[model] = true
@@ -2858,87 +2096,30 @@ local function createEggEntry(model)
     end
 
 
-    local Row =
-        Instance.new("Frame")
-
-    Row.Name =
-        "Egg"
-
-    Row.Size =
-        UDim2.new(
-            1,
-            -4,
-            0,
-            32
-        )
-
-    Row.BackgroundColor3 =
-        Color3.fromRGB(
-            35,
-            36,
-            46
-        )
-
+    local Row = Instance.new("Frame")
+    Row.Name = "Egg"
+    Row.Size = UDim2.new(1, -4, 0, 32)
+    Row.BackgroundColor3 = Color3.fromRGB(35, 36, 46)
     Row.BorderSizePixel = 0
-
-    Row.Parent =
-        group.Container
+    Row.Parent = group.Container
 
 
-    local RowCorner =
-        Instance.new("UICorner")
-
-    RowCorner.CornerRadius =
-        UDim.new(0, 6)
-
-    RowCorner.Parent =
-        Row
+    local RowCorner = Instance.new("UICorner")
+    RowCorner.CornerRadius = UDim.new(0, 6)
+    RowCorner.Parent = Row
 
 
-    local NameLabel =
-        Instance.new("TextLabel")
-
-    NameLabel.Size =
-        UDim2.new(
-            1,
-            -72,
-            1,
-            0
-        )
-
-    NameLabel.Position =
-        UDim2.new(
-            0,
-            8,
-            0,
-            0
-        )
-
+    local NameLabel = Instance.new("TextLabel")
+    NameLabel.Size = UDim2.new(1, -72, 1, 0)
+    NameLabel.Position = UDim2.new(0, 8, 0, 0)
     NameLabel.BackgroundTransparency = 1
-
-    NameLabel.Text =
-        model.Name
-
-    NameLabel.TextColor3 =
-        Color3.fromRGB(
-            220,
-            222,
-            235
-        )
-
-    NameLabel.TextXAlignment =
-        Enum.TextXAlignment.Left
-
-    NameLabel.Font =
-        Enum.Font.Gotham
-
+    NameLabel.Text = model.Name
+    NameLabel.TextColor3 = Color3.fromRGB(220, 222, 235)
+    NameLabel.TextXAlignment = Enum.TextXAlignment.Left
+    NameLabel.Font = Enum.Font.Gotham
     NameLabel.TextSize = 12
-
-    NameLabel.TextTruncate =
-        Enum.TextTruncate.AtEnd
-
-    NameLabel.Parent =
-        Row
+    NameLabel.TextTruncate = Enum.TextTruncate.AtEnd
+    NameLabel.Parent = Row
 
 
     local TP = Instance.new("TextButton")
@@ -2968,18 +2149,13 @@ local function createEggEntry(model)
     FlyCorner.Parent = FlyButton
 
     local entry = {
-
         Model = model,
-
         Frame = Row,
-
         Label = NameLabel
-
     }
 
 
-    EggEntries[model] =
-        entry
+    EggEntries[model] = entry
 
 
     TP.MouseButton1Click:Connect(function()
@@ -3038,26 +2214,22 @@ local function registerModel(model)
     end
 
 
-    if not model:IsDescendantOf(
-        RenderedEggs
-    ) then
-
+    if not model:IsDescendantOf(RenderedEggs) then
         return
-
     end
 
 
+    -- FIX: always register the top-level egg model, never a nested child.
+    model = resolveEggModel(model)
+
+
     if not EggEntries[model] then
-
         createEggEntry(model)
-
     end
 
 
     if not ESPs[model] then
-
         createESP(model)
-
     end
 
 
@@ -3321,20 +2493,13 @@ local function tryRegisterEgg(object)
     end
 
 
-    if not object
-        or not object:IsA("Model") then
-
+    if not object or not object:IsA("Model") then
         return
-
     end
 
 
-    if not object:IsDescendantOf(
-        RenderedEggs
-    ) then
-
+    if not object:IsDescendantOf(RenderedEggs) then
         return
-
     end
 
 
@@ -3342,26 +2507,21 @@ local function tryRegisterEgg(object)
 
         if not Running
             or not object.Parent
-            or not object:IsDescendantOf(
-                RenderedEggs
-            ) then
+            or not object:IsDescendantOf(RenderedEggs) then
 
             return
 
         end
 
 
-        local deadline =
-            os.clock() + 2
+        local deadline = os.clock() + 2
 
 
         repeat
 
             if not Running
                 or not object.Parent
-                or not object:IsDescendantOf(
-                    RenderedEggs
-                ) then
+                or not object:IsDescendantOf(RenderedEggs) then
 
                 return
 
@@ -3380,9 +2540,7 @@ local function tryRegisterEgg(object)
 
         if not Running
             or not object.Parent
-            or not object:IsDescendantOf(
-                RenderedEggs
-            ) then
+            or not object:IsDescendantOf(RenderedEggs) then
 
             return
 
@@ -3403,14 +2561,10 @@ end
 -- INITIAL SCAN
 --==============================================================
 
-for _, object in ipairs(
-    RenderedEggs:GetDescendants()
-) do
+for _, object in ipairs(RenderedEggs:GetDescendants()) do
 
     if object:IsA("Model") then
-
         registerModel(object)
-
     end
 
 end
@@ -3421,13 +2575,9 @@ end
 --==============================================================
 
 Connections.DescendantAdded =
-    RenderedEggs.DescendantAdded:Connect(
-        function(object)
-
-            tryRegisterEgg(object)
-
-        end
-    )
+    RenderedEggs.DescendantAdded:Connect(function(object)
+        tryRegisterEgg(object)
+    end)
 
 
 --==============================================================
@@ -3445,49 +2595,49 @@ getEggTopCFrame = function(egg)
     end
 
 
-    local cf, size =
-        egg:GetBoundingBox()
+    local cf, size = egg:GetBoundingBox()
 
 
-    if not isValidPosition(
-        cf.Position
-    ) then
-
+    if not isValidPosition(cf.Position) then
         return nil
-
     end
 
 
-    if not isFiniteNumber(size.Y)
-        or size.Y <= 0 then
-
+    if not isFiniteNumber(size.Y) or size.Y <= 0 then
         return nil
-
     end
 
 
-    local targetPosition =
-        Vector3.new(
-            cf.Position.X,
-            cf.Position.Y
-                + (size.Y * 0.5)
-                + HEIGHT_OFFSET,
-            cf.Position.Z
-        )
+    local topY = cf.Position.Y + (size.Y * 0.5)
 
+    -- Keep the character above the actual floor/terrain.
+    -- Some eggs have unusual bounding boxes, so using only GetBoundingBox
+    -- can occasionally produce a position below the map surface.
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    rayParams.FilterDescendantsInstances = {egg, Character, RenderedEggs}
+    rayParams.IgnoreWater = true
 
-    if not isValidPosition(
-        targetPosition
-    ) then
-
-        return nil
-
-    end
-
-
-    return CFrame.new(
-        targetPosition
+    local floorHit = workspace:Raycast(
+        Vector3.new(cf.Position.X, topY + 100, cf.Position.Z),
+        Vector3.new(0, -500, 0),
+        rayParams
     )
+
+    local safeY = topY + math.max(HEIGHT_OFFSET, 4)
+    if floorHit and floorHit.Position.Y + 4 > safeY then
+        safeY = floorHit.Position.Y + 4
+    end
+
+    local targetPosition = Vector3.new(cf.Position.X, safeY, cf.Position.Z)
+
+
+    if not isValidPosition(targetPosition) then
+        return nil
+    end
+
+
+    return CFrame.new(targetPosition)
 
 end
 
@@ -3496,73 +2646,59 @@ end
 -- SAFE TELEPORT
 --==============================================================
 
-safeTeleport = function(
-    character,
-    root,
-    targetCFrame
-)
+safeTeleport = function(character, root, targetCFrame)
 
-    if not character
-        or not character.Parent then
-
-        return false,
-            "Character is invalid"
-
+    if not character or not character.Parent then
+        return false, "Character is invalid"
     end
 
 
-    if not root
-        or not root.Parent then
-
-        return false,
-            "RootPart is invalid"
-
+    if not root or not root.Parent then
+        return false, "RootPart is invalid"
     end
 
 
     if not targetCFrame then
-
-        return false,
-            "Target is invalid"
-
+        return false, "Target is invalid"
     end
 
 
-    local targetPosition =
-        targetCFrame.Position
+    local targetPosition = targetCFrame.Position
 
 
-    if not isValidPosition(
-        targetPosition
-    ) then
-
-        return false,
-            "Target position is invalid"
-
+    if not isValidPosition(targetPosition) then
+        return false, "Target position is invalid"
     end
 
 
-    -- No distance check is performed.
-    -- Teleport directly to the target position.
+    -- Never place the character below the nearby floor.
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    rayParams.FilterDescendantsInstances = {character, RenderedEggs}
+    rayParams.IgnoreWater = true
 
-    root.AssemblyLinearVelocity =
-        Vector3.zero
-
-    root.AssemblyAngularVelocity =
-        Vector3.zero
-
-
-    character:PivotTo(
-        targetCFrame
+    local floorHit = workspace:Raycast(
+        targetPosition + Vector3.new(0, 60, 0),
+        Vector3.new(0, -120, 0),
+        rayParams
     )
 
+    if floorHit and targetPosition.Y < floorHit.Position.Y + 3 then
+        targetPosition = Vector3.new(
+            targetPosition.X,
+            floorHit.Position.Y + 3,
+            targetPosition.Z
+        )
+        targetCFrame = CFrame.new(targetPosition)
+    end
 
-    root.AssemblyLinearVelocity =
-        Vector3.zero
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
 
-    root.AssemblyAngularVelocity =
-        Vector3.zero
+    character:PivotTo(targetCFrame)
 
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
 
     return true
 
@@ -3580,11 +2716,8 @@ local function scanMyPlot()
     end
 
 
-    if PlotScanCount >=
-        MAX_PLOT_SCANS then
-
+    if PlotScanCount >= MAX_PLOT_SCANS then
         return CachedMyPlot
-
     end
 
 
@@ -3594,61 +2727,34 @@ local function scanMyPlot()
     CachedBaseplate = nil
 
 
-    for _, plot in ipairs(
-        Plots:GetChildren()
-    ) do
+    for _, plot in ipairs(Plots:GetChildren()) do
 
-        local data =
-            plot:FindFirstChild(
-                "Data"
-            )
+        local data = plot:FindFirstChild("Data")
 
 
         if data then
 
-            local owner =
-                data:FindFirstChild(
-                    "Owner"
-                )
+            local owner = data:FindFirstChild("Owner")
 
 
             if owner
-                and owner:IsA(
-                    "ObjectValue"
-                )
-                and owner.Value ==
-                    LocalPlayer then
+                and owner:IsA("ObjectValue")
+                and owner.Value == LocalPlayer then
 
 
-                CachedMyPlot =
-                    plot
+                CachedMyPlot = plot
 
 
-                local baseplate =
-                    plot:FindFirstChild(
-                        "Baseplate"
-                    )
+                local baseplate = plot:FindFirstChild("Baseplate")
 
 
                 if not baseplate then
-
-                    baseplate =
-                        plot:FindFirstChild(
-                            "Baseplate",
-                            true
-                        )
-
+                    baseplate = plot:FindFirstChild("Baseplate", true)
                 end
 
 
-                if baseplate
-                    and baseplate:IsA(
-                        "BasePart"
-                    ) then
-
-                    CachedBaseplate =
-                        baseplate
-
+                if baseplate and baseplate:IsA("BasePart") then
+                    CachedBaseplate = baseplate
                 end
 
 
@@ -3672,29 +2778,15 @@ end
 
 local function getMyPlot()
 
-    if CachedMyPlot
-        and CachedMyPlot.Parent then
+    if CachedMyPlot and CachedMyPlot.Parent then
 
-
-        local data =
-            CachedMyPlot:FindFirstChild(
-                "Data"
-            )
-
-
-        local owner =
-            data
-            and data:FindFirstChild(
-                "Owner"
-            )
+        local data = CachedMyPlot:FindFirstChild("Data")
+        local owner = data and data:FindFirstChild("Owner")
 
 
         if owner
-            and owner:IsA(
-                "ObjectValue"
-            )
-            and owner.Value ==
-                LocalPlayer then
+            and owner:IsA("ObjectValue")
+            and owner.Value == LocalPlayer then
 
             return CachedMyPlot
 
@@ -3714,8 +2806,7 @@ end
 
 getMyPlotBaseplate = function()
 
-    local plot =
-        getMyPlot()
+    local plot = getMyPlot()
 
 
     if not plot then
@@ -3725,42 +2816,24 @@ getMyPlotBaseplate = function()
 
     if CachedBaseplate
         and CachedBaseplate.Parent
-        and CachedBaseplate:IsDescendantOf(
-            plot
-        ) then
+        and CachedBaseplate:IsDescendantOf(plot) then
 
         return CachedBaseplate
 
     end
 
 
-    local baseplate =
-        plot:FindFirstChild(
-            "Baseplate"
-        )
+    local baseplate = plot:FindFirstChild("Baseplate")
 
 
     if not baseplate then
-
-        baseplate =
-            plot:FindFirstChild(
-                "Baseplate",
-                true
-            )
-
+        baseplate = plot:FindFirstChild("Baseplate", true)
     end
 
 
-    if baseplate
-        and baseplate:IsA(
-            "BasePart"
-        ) then
-
-        CachedBaseplate =
-            baseplate
-
+    if baseplate and baseplate:IsA("BasePart") then
+        CachedBaseplate = baseplate
         return baseplate
-
     end
 
 
@@ -3773,9 +2846,7 @@ end
 -- BASEPLATE TOP
 --==============================================================
 
-getBaseplateTopCFrame = function(
-    baseplate
-)
+getBaseplateTopCFrame = function(baseplate)
 
     if not baseplate
         or not baseplate:IsA("BasePart")
@@ -3786,49 +2857,28 @@ getBaseplateTopCFrame = function(
     end
 
 
-    local size =
-        baseplate.Size
-
-    local cf =
-        baseplate.CFrame
+    local size = baseplate.Size
+    local cf = baseplate.CFrame
 
 
-    if not isFiniteNumber(size.Y)
-        or size.Y <= 0 then
-
+    if not isFiniteNumber(size.Y) or size.Y <= 0 then
         return nil
-
     end
 
 
-    if not isValidPosition(
-        cf.Position
-    ) then
-
+    if not isValidPosition(cf.Position) then
         return nil
-
     end
 
 
-    local verticalOffset =
-        (size.Y * 0.5)
-        + HEIGHT_OFFSET
+    local verticalOffset = (size.Y * 0.5) + HEIGHT_OFFSET
 
 
-    local target =
-        cf * CFrame.new(
-            0,
-            verticalOffset,
-            0
-        )
+    local target = cf * CFrame.new(0, verticalOffset, 0)
 
 
-    if not isValidPosition(
-        target.Position
-    ) then
-
+    if not isValidPosition(target.Position) then
         return nil
-
     end
 
 
@@ -3841,162 +2891,87 @@ end
 -- GLOBAL ESP BUTTON
 --==============================================================
 
-GlobalToggle.MouseButton1Click:Connect(
-    function()
+GlobalToggle.MouseButton1Click:Connect(function()
 
-        GlobalESPEnabled =
-            not GlobalESPEnabled
+    GlobalESPEnabled = not GlobalESPEnabled
 
 
-        if GlobalESPEnabled then
-
-            GlobalToggle.Text =
-                "ESP  |  ON"
-
-            GlobalToggle.BackgroundColor3 =
-                Color3.fromRGB(
-                    60,
-                    155,
-                    95
-                )
-
-        else
-
-            GlobalToggle.Text =
-                "ESP  |  OFF"
-
-            GlobalToggle.BackgroundColor3 =
-                Color3.fromRGB(
-                    145,
-                    65,
-                    75
-                )
-
-        end
+    if GlobalESPEnabled then
+        GlobalToggle.Text = "ESP  |  ON"
+        GlobalToggle.BackgroundColor3 = Color3.fromRGB(60, 155, 95)
+    else
+        GlobalToggle.Text = "ESP  |  OFF"
+        GlobalToggle.BackgroundColor3 = Color3.fromRGB(145, 65, 75)
+    end
 
 
-        for model, esp in pairs(
-            ESPs
-        ) do
+    for model, esp in pairs(ESPs) do
 
-            if esp then
+        if esp then
 
-                local group =
-                    EggGroups[
-                        model.Name
-                    ]
+            local enabled = GlobalESPEnabled and getEggTypeEnabled(model)
 
+            esp.Billboard.Enabled = enabled
 
-                local enabled =
-                    GlobalESPEnabled and getEggTypeEnabled(model)
-
-
-                esp.Billboard.Enabled =
-                    enabled
-
-
-                if esp.Highlight then
-
-                    esp.Highlight.Enabled =
-                        enabled
-
-                end
-
+            if esp.Highlight then
+                esp.Highlight.Enabled = enabled
             end
 
         end
 
     end
-)
+
+end)
 
 
 --==============================================================
 -- TP MY PLOT
 --==============================================================
 
-PlotTP.MouseButton1Click:Connect(
-    function()
+PlotTP.MouseButton1Click:Connect(function()
 
-        if not Running then
-            return
-        end
-
-
-        getCharacter()
-
-
-        if not Character
-            or not RootPart then
-
-            showStatus(
-                "Character not found"
-            )
-
-            return
-
-        end
-
-
-        local baseplate =
-            getMyPlotBaseplate()
-
-
-        if not baseplate then
-
-            showStatus(
-                "Your Plot was not found"
-            )
-
-            return
-
-        end
-
-
-        local target =
-            getBaseplateTopCFrame(
-                baseplate
-            )
-
-
-        if not target then
-
-            showStatus(
-                "Invalid Baseplate"
-            )
-
-            return
-
-        end
-
-
-        local success, reason =
-            safeTeleport(
-                Character,
-                RootPart,
-                target
-            )
-
-
-        if success then
-
-            showStatus(
-                "Teleported to My Plot"
-            )
-
-        else
-
-            showStatus(
-                "Teleport failed: "
-                .. tostring(reason)
-            )
-
-        end
-
+    if not Running then
+        return
     end
-)
 
 
---==============================================================
+    getCharacter()
+
+
+    if not Character or not RootPart then
+        showStatus("Character not found")
+        return
+    end
+
+
+    local baseplate = getMyPlotBaseplate()
+
+
+    if not baseplate then
+        showStatus("Your Plot was not found")
+        return
+    end
+
+
+    local target = getBaseplateTopCFrame(baseplate)
+
+
+    if not target then
+        showStatus("Invalid Baseplate")
+        return
+    end
+
+
+    local success, reason = safeTeleport(Character, RootPart, target)
+
+
+    if success then
+        showStatus("Teleported to My Plot")
+    else
+        showStatus("Teleport failed: " .. tostring(reason))
+    end
+
+end)
 
 
 --==============================================================
@@ -4005,33 +2980,21 @@ PlotTP.MouseButton1Click:Connect(
 
 updateSearch = function()
 
-    local query =
-        string.lower(
-            Search.Text or ""
-        )
+    local query = string.lower(Search.Text or "")
 
     local groupHasMatch = {}
 
     for model, entry in pairs(EggEntries) do
         if entry and entry.Model and entry.Frame and entry.Model.Parent then
-            local name =
-                string.lower(
-                    entry.Model.Name
-                )
+            local name = string.lower(entry.Model.Name)
 
             local matches =
                 query == ""
-                or string.find(
-                    name,
-                    query,
-                    1,
-                    true
-                ) ~= nil
+                or string.find(name, query, 1, true) ~= nil
 
             entry.Frame.Visible = matches
 
-            local group =
-                EggGroups[entry.Model.Name]
+            local group = EggGroups[entry.Model.Name]
 
             if group and matches then
                 groupHasMatch[group] = true
@@ -4049,16 +3012,112 @@ updateSearch = function()
         end
     end
 
-
 end
 
 
-Search:GetPropertyChangedSignal(
-    "Text"
-):Connect(
-    updateSearch
-)
+Search:GetPropertyChangedSignal("Text"):Connect(updateSearch)
 
+
+--==============================================================
+-- PROXIMITY PICKUP  (FIXED)
+--==============================================================
+-- Fixes:
+--  * works on the top-level egg model (resolveEggModel)
+--  * waits up to PICKUP_WAIT_TIMEOUT for the prompt (streaming / late creation)
+--  * fuzzy match: Name or ActionText containing "pick", else first prompt
+--  * prints the egg's descendant tree when nothing is found
+--  * locals instead of leaked globals
+
+-- Print the egg's children so the real prompt name/location is visible in F9.
+debugEggHierarchy = function(egg)
+    warn("[Pickup] No ProximityPrompt found in: " .. egg:GetFullName())
+    for _, obj in ipairs(egg:GetDescendants()) do
+        print("   ", obj.ClassName, obj:GetFullName())
+    end
+end
+
+getEggPickupPrompt = function(egg)
+    if not egg or not egg.Parent then
+        return nil
+    end
+
+    local containers = { egg }
+    local top = resolveEggModel(egg)
+    if top ~= egg then
+        table.insert(containers, top)
+    end
+
+    local fallback = nil
+    for _, container in ipairs(containers) do
+        for _, obj in ipairs(container:GetDescendants()) do
+            if obj:IsA("ProximityPrompt") then
+                local name = string.lower(obj.Name)
+                local action = string.lower(obj.ActionText)
+
+                if string.find(name, "pick", 1, true)
+                    or string.find(action, "pick", 1, true) then
+                    return obj
+                end
+
+                fallback = fallback or obj
+            end
+        end
+    end
+
+    return fallback
+end
+
+local function waitForPickupPrompt(egg, timeout)
+    local deadline = os.clock() + timeout
+    repeat
+        local prompt = getEggPickupPrompt(egg)
+        if prompt then
+            return prompt
+        end
+        task.wait(0.1)
+    until os.clock() >= deadline or not egg.Parent
+
+    return nil
+end
+
+instantPickupEgg = function(egg)
+    if not egg or not egg.Parent then
+        return false, "Egg no longer exists"
+    end
+
+    egg = resolveEggModel(egg)
+
+    local prompt = waitForPickupPrompt(egg, PICKUP_WAIT_TIMEOUT)
+    if not prompt or not prompt.Parent then
+        if egg.Parent then
+            debugEggHierarchy(egg)
+        end
+        return false, "Pickup prompt not found"
+    end
+
+    pcall(function()
+        prompt.Enabled = true
+        prompt.HoldDuration = 0
+        prompt.RequiresLineOfSight = false
+        prompt.MaxActivationDistance = math.max(prompt.MaxActivationDistance, 10000)
+    end)
+
+    if typeof(fireproximityprompt) == "function" then
+        if pcall(fireproximityprompt, prompt, 1, true)
+            or pcall(fireproximityprompt, prompt) then
+            return true, "fireproximityprompt"
+        end
+    end
+
+    local began = pcall(function() prompt:InputHoldBegin() end)
+    task.wait(0.05)
+    local ended = pcall(function() prompt:InputHoldEnd() end)
+
+    if began and ended then
+        return true, "InputHold"
+    end
+    return false, "Prompt activation failed"
+end
 
 --==============================================================
 -- AUTO FARM ENGINE
@@ -4102,31 +3161,66 @@ runAutoFarm = function()
             end
 
             if not egg then
-                if AutoFarmListOpen then refreshAutoFarmRows() end
                 task.wait(0.35)
                 continue
             end
 
-            if AutoFarmMode == "TP" then
+            -- Auto Farm tự chọn cách di chuyển:
+            -- mọi egg dùng TP; riêng Volcanic Egg dùng Pathfinding.
+            if string.lower(egg.Name) == "volcanic egg" then
+                if not FlyBusy then
+                    -- Auto Farm luôn bật đường quay về My Plot sau khi pickup.
+                    local previousReturn = FlyToPlotAfterEgg
+                    FlyToPlotAfterEgg = true
+                    flyToTarget(egg, true)
+                    FlyToPlotAfterEgg = previousReturn
+                end
+            else
                 getCharacter()
-                local target = getEggTopCFrame(egg)
-                if Character and RootPart and target then
-                    local teleported = safeTeleport(Character, RootPart, target)
+                -- FIX: hover just above the egg (FlyHeight) instead of ~20 studs up.
+                local hover = getEggHoverPosition(egg)
+                if Character and RootPart and hover then
+                    local teleported = safeTeleport(Character, RootPart, CFrame.new(hover))
                     if teleported then
                         showStatus("Auto TP -> " .. egg.Name, 0.8)
                     end
                 end
-                task.wait(AutoFarmDelay)
-            else
-                -- Run Fly synchronously so Auto Farm never starts multiple
-                -- Fly jobs for the same egg and never loses track of FlyBusy.
-                if not FlyBusy then
-                    flyToTarget(egg, true)
-                    task.wait(AutoFarmDelay)
-                else
-                    task.wait(0.08)
+
+                -- Kích hoạt Pickup ngay sau khi TP tới egg.
+                if egg.Parent and egg:IsDescendantOf(RenderedEggs) then
+                    local picked, how = instantPickupEgg(egg)
+                    if picked then
+                        showStatus("Auto Pickup -> " .. egg.Name, 0.6)
+                    else
+                        showStatus("Auto Pickup failed: " .. tostring(how), 1.5)
+                    end
+                end
+
+                -- Chờ egg được nhặt/xóa, sau đó tự quay về My Plot
+                -- trước khi bắt đầu vòng Auto Farm tiếp theo.
+                local deadline = os.clock() + 3
+                while Running and AutoFarmEnabled and token == AutoFarmToken
+                    and egg.Parent and egg:IsDescendantOf(RenderedEggs)
+                    and os.clock() < deadline do
+                    task.wait(0.05)
+                end
+
+                if Running and AutoFarmEnabled and token == AutoFarmToken then
+                    getCharacter()
+                    local baseplate = getMyPlotBaseplate()
+                    if baseplate and Character and RootPart then
+                        local plotTarget = getBaseplateTopCFrame(baseplate)
+                        if plotTarget then
+                            local returned = safeTeleport(Character, RootPart, plotTarget)
+                            if returned then
+                                showStatus("Auto Farm -> My Plot", 0.7)
+                            end
+                        end
+                    end
                 end
             end
+
+            task.wait(AutoFarmDelay)
         end
     end)
 
@@ -4150,28 +3244,22 @@ task.spawn(function()
         getCharacter()
 
 
-        local root =
-            RootPart
+        local root = RootPart
 
 
 
-        for model, esp in pairs(
-            ESPs
-        ) do
+        for model, esp in pairs(ESPs) do
 
 
             if not model
                 or not model.Parent
-                or not model:IsDescendantOf(
-                    RenderedEggs
-                ) then
+                or not model:IsDescendantOf(RenderedEggs) then
 
 
                 destroyESP(model)
 
 
-                local entry =
-                    EggEntries[model]
+                local entry = EggEntries[model]
 
 
                 if entry then
@@ -4180,24 +3268,18 @@ task.spawn(function()
                         entry.Frame:Destroy()
                     end
 
-                    EggEntries[model] =
-                        nil
+                    EggEntries[model] = nil
 
                 end
 
 
-                local group =
-                    EggGroups[
-                        model.Name
-                    ]
+                local group = EggGroups[model.Name]
 
 
                 if group then
-                    group.Eggs[model] =
-                        nil
+                    group.Eggs[model] = nil
 
-                    if next(group.Eggs) then
-                    else
+                    if not next(group.Eggs) then
                         group.GroupFrame:Destroy()
                         EggGroups[model.Name] = nil
                     end
@@ -4207,8 +3289,7 @@ task.spawn(function()
             else
 
 
-                local eggRoot =
-                    getRootPart(model)
+                local eggRoot = getRootPart(model)
 
 
                 if eggRoot then
@@ -4218,28 +3299,14 @@ task.spawn(function()
 
 
                     if root then
-
-                        distance =
-                            (
-                                root.Position
-                                - eggRoot.Position
-                            ).Magnitude
-
+                        distance = (root.Position - eggRoot.Position).Magnitude
                     end
 
 
-                    local group =
-                        EggGroups[
-                            model.Name
-                        ]
+                    local enabled = GlobalESPEnabled and getEggTypeEnabled(model)
 
 
-                    local enabled =
-                        GlobalESPEnabled and getEggTypeEnabled(model)
-
-
-                    esp.Billboard.Enabled =
-                        enabled
+                    esp.Billboard.Enabled = enabled
 
 
                     local rarityInfo = getManualRarity(model.Name)
@@ -4249,37 +3316,27 @@ task.spawn(function()
                     if esp.Highlight then
                         esp.Highlight.FillColor = rarityColor
                         esp.Highlight.OutlineColor = rarityColor
-                        esp.Highlight.Enabled =
-                            enabled
+                        esp.Highlight.Enabled = enabled
                     end
 
 
                     esp.Label.Text = getESPDisplayText(model, rarityInfo, root and distance or nil)
 
 
-                    local entry =
-                        EggEntries[model]
+                    local entry = EggEntries[model]
 
 
                     if entry then
 
                         if root then
-
                             entry.Label.Text =
                                 model.Name
                                 .. "  ["
-                                .. math.floor(
-                                    distance
-                                )
+                                .. math.floor(distance)
                                 .. " studs]"
-
                         else
-
-                            entry.Label.Text =
-                                model.Name
-
+                            entry.Label.Text = model.Name
                         end
-
 
                     end
 
@@ -4290,17 +3347,13 @@ task.spawn(function()
         end
 
 
-        if Status.Visible
-            and os.clock() >= StatusExpiresAt then
-
+        if Status.Visible and os.clock() >= StatusExpiresAt then
             Status.Visible = false
             Status.Text = ""
         end
 
 
-        task.wait(
-            UPDATE_RATE
-        )
+        task.wait(UPDATE_RATE)
 
     end
 
@@ -4325,25 +3378,17 @@ shutdown = function()
     FlyBusy = false
 
 
-    for model in pairs(
-        ESPs
-    ) do
-
+    for model in pairs(ESPs) do
         destroyESP(model)
-
     end
 
 
-    for _, connection in pairs(
-        Connections
-    ) do
+    for _, connection in pairs(Connections) do
 
         if connection then
-
             pcall(function()
                 connection:Disconnect()
             end)
-
         end
 
     end
@@ -4356,62 +3401,56 @@ shutdown = function()
 end
 
 
-Minimize.MouseButton1Click:Connect(
-    function()
-        MainMinimized = not MainMinimized
+Minimize.MouseButton1Click:Connect(function()
+    MainMinimized = not MainMinimized
 
-        local position = Main.Position
-        local halfHeightDifference =
-            (MainExpandedSize.Y.Offset - MINIMIZED_HEIGHT)
-            * MainScale.Scale
-            * 0.5
+    local position = Main.Position
+    local halfHeightDifference =
+        (MainExpandedSize.Y.Offset - MINIMIZED_HEIGHT)
+        * MainScale.Scale
+        * 0.5
 
-        if MainMinimized then
-            dragging = false
-            resizing = false
-            ResizeHandle.Visible = false
+    if MainMinimized then
+        dragging = false
+        resizing = false
+        ResizeHandle.Visible = false
 
-            Main.Position = UDim2.new(
-                position.X.Scale,
-                position.X.Offset,
-                position.Y.Scale,
-                position.Y.Offset - halfHeightDifference
-            )
+        Main.Position = UDim2.new(
+            position.X.Scale,
+            position.X.Offset,
+            position.Y.Scale,
+            position.Y.Offset - halfHeightDifference
+        )
 
-            Main.Size = UDim2.new(
-                MainExpandedSize.X.Scale,
-                MainExpandedSize.X.Offset,
-                0,
-                MINIMIZED_HEIGHT
-            )
+        Main.Size = UDim2.new(
+            MainExpandedSize.X.Scale,
+            MainExpandedSize.X.Offset,
+            0,
+            MINIMIZED_HEIGHT
+        )
 
-            Minimize.Text = "+"
-        else
-            ResizeHandle.Visible = true
-            Main.Size = MainExpandedSize
+        Minimize.Text = "+"
+    else
+        ResizeHandle.Visible = true
+        Main.Size = MainExpandedSize
 
-            Main.Position = UDim2.new(
-                position.X.Scale,
-                position.X.Offset,
-                position.Y.Scale,
-                position.Y.Offset + halfHeightDifference
-            )
+        Main.Position = UDim2.new(
+            position.X.Scale,
+            position.X.Offset,
+            position.Y.Scale,
+            position.Y.Offset + halfHeightDifference
+        )
 
-            Minimize.Text = "-"
-        end
+        Minimize.Text = "-"
     end
-)
+end)
 
 
-Close.MouseButton1Click:Connect(
-    shutdown
-)
+Close.MouseButton1Click:Connect(shutdown)
 
 
 --==============================================================
 -- START
 --==============================================================
 
-print(
-    "[Rendered Eggs] ESP + Fly loaded"
-)
+print("[Rendered Eggs] ESP + Fly loaded")
