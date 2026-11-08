@@ -26,6 +26,22 @@ local mathHuge = math.huge
 local taskWait, taskDelay = task.wait, task.delay
 local CFAngles = CFrame.Angles
 
+-- Random instance names (new name for every instance)
+local rng = Random.new()
+local NAME_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+local function randomName()
+    local len = rng:NextInteger(8, 14)
+    local out = table.create(len)
+
+    for i = 1, len do
+        local n = rng:NextInteger(1, #NAME_CHARS)
+        out[i] = NAME_CHARS:sub(n, n)
+    end
+
+    return table.concat(out)
+end
+
 local LP = Players.LocalPlayer
 local Mouse = LP:GetMouse()
 
@@ -57,6 +73,7 @@ for _, name in ipairs(CLEANUP_NAMES) do
 end
 
 do
+    -- Leftovers from older versions that used fixed names
     local STALE = {
         SelectedSeat = true,
         SeatPickerHighlight = true,
@@ -121,6 +138,7 @@ local seatPickerEnabled = false
 
 local currentSeat = nil
 local pendingSeat = nil
+local charWeldInst = nil
 
 local highlight = nil
 
@@ -207,7 +225,7 @@ end
 -- BLOCK SPACE WHILE SEATED
 --==================================================
 
-local SPACE_ACTION = "UnifiedSeatPicker_BlockSpace"
+local SPACE_ACTION = randomName()
 
 CAS:BindActionAtPriority(
     SPACE_ACTION,
@@ -283,7 +301,7 @@ end
 local function createButton(name, text, size, position, parent)
     local b = Instance.new("TextButton")
 
-    b.Name = name
+    b.Name = randomName()
     b.Text = text
 
     b.Size = size
@@ -305,6 +323,7 @@ end
 
 local function createLabel(size, position, text, font, textSize, color, parent)
     local l = Instance.new("TextLabel")
+    l.Name = randomName()
 
     l.Size = size
     l.Position = position
@@ -327,7 +346,7 @@ end
 
 local gui = Instance.new("ScreenGui")
 
-gui.Name = "UnifiedFlySeatGui"
+gui.Name = randomName()
 gui.ResetOnSpawn = false
 gui.DisplayOrder = 100
 
@@ -347,7 +366,7 @@ end
 
 local main = Instance.new("Frame")
 
-main.Name = "Main"
+main.Name = randomName()
 main.Size = UDim2.fromOffset(190, 224)
 main.Position = UDim2.new(0, 20, 0.35, 0)
 
@@ -482,7 +501,7 @@ local function updateHighlight(part)
     if not highlight or not highlight.Parent then
         highlight = Instance.new("Highlight")
 
-        highlight.Name = "SeatPickerHighlight"
+        highlight.Name = randomName()
 
         highlight.FillColor = GREEN
         highlight.FillTransparency = 0.5
@@ -560,14 +579,9 @@ local function cleanupSeat(resetHumanoid)
         pcall(tempSeat.Destroy, tempSeat)
     end
 
-    local char = getCharacter()
-
-    if char then
-        for _, obj in ipairs(char:GetDescendants()) do
-            if obj.Name == "SeatPickerCharWeld" then
-                pcall(obj.Destroy, obj)
-            end
-        end
+    if charWeldInst then
+        pcall(charWeldInst.Destroy, charWeldInst)
+        charWeldInst = nil
     end
 
     if resetHumanoid then
@@ -721,7 +735,7 @@ local function sitOnPart(part)
     -- METHOD 1: SEAT:SIT
     local seat = Instance.new("Seat")
 
-    seat.Name = "SelectedSeat"
+    seat.Name = randomName()
     seat.Size = Vector3.new(2, 0.2, 2)
 
     seat.CFrame = seatCFrame
@@ -749,7 +763,7 @@ local function sitOnPart(part)
         if not FREEZE_PART then
             local weld = Instance.new("WeldConstraint")
 
-            weld.Name = "SeatPickerWeld"
+            weld.Name = randomName()
             weld.Part0 = seat
             weld.Part1 = part
 
@@ -802,7 +816,7 @@ local function sitOnPart(part)
     if FREEZE_PART then
         local frozenSeat = Instance.new("Part")
 
-        frozenSeat.Name = "SelectedSeat"
+        frozenSeat.Name = randomName()
         frozenSeat.Size = Vector3.new(2, 0.2, 2)
 
         frozenSeat.CFrame = seatCFrame
@@ -818,7 +832,7 @@ local function sitOnPart(part)
 
         local partWeld = Instance.new("WeldConstraint")
 
-        partWeld.Name = "SeatPickerWeld"
+        partWeld.Name = randomName()
         partWeld.Part0 = frozenSeat
         partWeld.Part1 = part
 
@@ -828,19 +842,21 @@ local function sitOnPart(part)
 
         local charWeld = Instance.new("Weld")
 
-        charWeld.Name = "SeatPickerCharWeld"
+        charWeld.Name = randomName()
         charWeld.Part0 = frozenSeat
         charWeld.Part1 = rootPart
 
         charWeld.C0 = CFrame.new(0, 2.5, 0)
         charWeld.Parent = rootPart
 
+        charWeldInst = charWeld
+
         setupStandUpListener(hum, frozenSeat)
 
     else
         local weld = Instance.new("Weld")
 
-        weld.Name = "SeatPickerWeld"
+        weld.Name = randomName()
         weld.Part0 = part
         weld.Part1 = rootPart
 
@@ -985,11 +1001,11 @@ end
 
 local function createFlyPhysics()
     attachment = Instance.new("Attachment")
-    attachment.Name = "UnifiedFlyAttachment"
+    attachment.Name = randomName()
     attachment.Parent = root
 
     velocity = Instance.new("LinearVelocity")
-    velocity.Name = "UnifiedFlyVelocity"
+    velocity.Name = randomName()
 
     velocity.Attachment0 = attachment
     velocity.RelativeTo = Enum.ActuatorRelativeTo.World
@@ -1002,7 +1018,7 @@ local function createFlyPhysics()
     velocity.Parent = root
 
     orientation = Instance.new("AlignOrientation")
-    orientation.Name = "UnifiedFlyOrientation"
+    orientation.Name = randomName()
 
     orientation.Mode = Enum.OrientationAlignmentMode.OneAttachment
 
@@ -1354,7 +1370,7 @@ connect(UIS.WindowFocusReleased, clearKeys)
 
 local mobile = Instance.new("Frame")
 
-mobile.Name = "MobileControls"
+mobile.Name = randomName()
 mobile.Size = UDim2.fromOffset(160, 145)
 
 mobile.Position = UDim2.new(1, -175, 1, -165)
