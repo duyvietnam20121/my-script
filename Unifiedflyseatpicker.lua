@@ -55,6 +55,63 @@ local VEC_ZERO = Vector3.zero
 local VEC_Y = Vector3.yAxis
 
 --==================================================
+-- CONFIG (keys, speed, update frequencies)
+--==================================================
+
+local CONFIG = {
+    -- PC hotkeys
+    KEYS = {
+        FLY = KC.F,          -- toggle fly
+        SEAT_PICKER = KC.G,  -- toggle Seat Picker
+        EXIT_SEAT = KC.E,    -- leave the picked seat
+    },
+
+    -- Movement keys (action -> key codes)
+    MOVE_KEYS = {
+        W = { KC.W },
+        A = { KC.A },
+        S = { KC.S },
+        D = { KC.D },
+        Up = { KC.Space },
+        Down = { KC.LeftShift, KC.RightShift, KC.LeftControl, KC.RightControl },
+    },
+
+    -- Fly speed (studs/second)
+    SPEED = {
+        DEFAULT = 50,
+        MIN = 10,
+        MAX = 250,
+        STEP = 10,
+    },
+
+    -- Seconds between updates
+    INTERVALS = {
+        STATUS = 0.2,          -- status text
+        HIGHLIGHT = 0.05,      -- Seat Picker highlight
+        SIM_RADIUS = 0.25,     -- SimulationRadius write (while flying)
+        CENTER_OF_MASS = 0.2,  -- assembly center-of-mass re-read (while flying)
+        STABILIZE = 1 / 30,    -- anti tilt / anti spin (while flying)
+        MASSLESS = 1,          -- Massless pass (while flying)
+    },
+
+    -- Massless pass
+    MASSLESS = {
+        PER_SECOND = 25,   -- parts handled per pass (50 = faster rollout)
+        RADIUS = 120,      -- studs around the player
+        QUERY_MAX = 500,   -- hard cap on parts returned per query
+    },
+}
+
+-- Button labels (key hints come from CONFIG.KEYS)
+local LABELS = {
+    FLY_ON = ("FLY [%s]: ON"):format(CONFIG.KEYS.FLY.Name),
+    FLY_OFF = ("FLY [%s]: OFF"):format(CONFIG.KEYS.FLY.Name),
+    SEAT_ON = ("SEAT PICKER [%s]: ON"):format(CONFIG.KEYS.SEAT_PICKER.Name),
+    SEAT_OFF = ("SEAT PICKER [%s]: OFF"):format(CONFIG.KEYS.SEAT_PICKER.Name),
+    EXIT = ("EXIT SEAT [%s]"):format(CONFIG.KEYS.EXIT_SEAT.Name),
+}
+
+--==================================================
 -- CLEAN OLD SCRIPTS
 --==================================================
 
@@ -106,10 +163,10 @@ end
 local FREEZE_PART = false
 
 -- Fly
-local speed = 50
-local minSpeed = 10
-local maxSpeed = 250
-local speedStep = 10
+local speed = CONFIG.SPEED.DEFAULT
+local minSpeed = CONFIG.SPEED.MIN
+local maxSpeed = CONFIG.SPEED.MAX
+local speedStep = CONFIG.SPEED.STEP
 
 -- Seated speed
 local SEATED_SPEED_CAP = 80
@@ -265,7 +322,7 @@ pcall(function()
     LP.ReplicationFocus = Workspace
 end)
 
--- Resolved once; stepped inside the single Heartbeat loop below
+-- Resolved once; used by the fly loop (SimulationRadius) and Massless
 local setHidden = type(sethiddenproperty) == "function"
     and sethiddenproperty
     or nil
@@ -298,7 +355,7 @@ local function addCorner(obj, radius)
     c.Parent = obj
 end
 
-local function createButton(name, text, size, position, parent)
+local function createButton(text, size, position, parent)
     local b = Instance.new("TextButton")
 
     b.Name = randomName()
@@ -388,8 +445,7 @@ createLabel(
 
 -- FLY BUTTON
 local flyButton = createButton(
-    "FlyToggle",
-    "FLY: OFF",
+    LABELS.FLY_OFF,
     UDim2.new(1, -16, 0, 31),
     UDim2.fromOffset(8, 32),
     main
@@ -397,7 +453,6 @@ local flyButton = createButton(
 
 -- SPEED
 local minus = createButton(
-    "SpeedMinus",
     "-",
     UDim2.fromOffset(42, 27),
     UDim2.fromOffset(8, 69),
@@ -406,12 +461,11 @@ local minus = createButton(
 
 local speedLabel = createLabel(
     UDim2.fromOffset(82, 27), UDim2.fromOffset(54, 69),
-    "50",
+    tostring(speed),
     Enum.Font.GothamBold, 14, WHITE, main
 )
 
 local plus = createButton(
-    "SpeedPlus",
     "+",
     UDim2.fromOffset(42, 27),
     UDim2.fromOffset(140, 69),
@@ -420,8 +474,7 @@ local plus = createButton(
 
 -- SEAT PICKER
 local seatButton = createButton(
-    "SeatToggle",
-    "SEAT PICKER: ON",
+    LABELS.SEAT_OFF,
     UDim2.new(1, -16, 0, 31),
     UDim2.fromOffset(8, 103),
     main
@@ -429,8 +482,7 @@ local seatButton = createButton(
 
 -- EXIT SEAT
 local exitButton = createButton(
-    "ExitSeat",
-    "EXIT SEAT",
+    LABELS.EXIT,
     UDim2.new(1, -16, 0, 31),
     UDim2.fromOffset(8, 140),
     main
@@ -450,12 +502,10 @@ local statusLabel = createLabel(
 --==================================================
 
 local function updateGUI()
-    flyButton.Text = flying and "FLY: ON" or "FLY: OFF"
+    flyButton.Text = flying and LABELS.FLY_ON or LABELS.FLY_OFF
     flyButton.BackgroundColor3 = flying and COLOR_ON or COLOR_OFF
 
-    seatButton.Text = seatPickerEnabled
-        and "SEAT PICKER: ON"
-        or "SEAT PICKER: OFF"
+    seatButton.Text = seatPickerEnabled and LABELS.SEAT_ON or LABELS.SEAT_OFF
     seatButton.BackgroundColor3 = seatPickerEnabled and COLOR_ON or COLOR_OFF
 
     speedLabel.Text = tostring(speed)
@@ -879,7 +929,8 @@ end
 --==================================================
 
 local function exitSeat()
-    -- Removes custom seat/welds and resets the humanoid
+    -- Cancel any in-flight sit attempt, then remove seat/welds and reset the humanoid
+    sitToken += 1
     cleanupSeat(true)
 
     print("[Unified] Exit seat requested")
@@ -1073,6 +1124,26 @@ end
 -- FLY ON / OFF
 --==================================================
 
+local statusTimer = 0
+local highlightTimer = 0
+local simTimer = 0
+local comTimer = 0
+local stabTimer = 0
+local lastSeatedState = nil
+
+local STATUS_INTERVAL = CONFIG.INTERVALS.STATUS
+local SIM_INTERVAL = CONFIG.INTERVALS.SIM_RADIUS
+local COM_INTERVAL = CONFIG.INTERVALS.CENTER_OF_MASS
+local STAB_INTERVAL = CONFIG.INTERVALS.STABILIZE
+local HIGHLIGHT_INTERVAL = CONFIG.INTERVALS.HIGHLIGHT
+
+-- The fly loop is connected only while fly is ON (defined further below)
+local flyStep
+local flyConn = nil
+
+-- Massless runs only while fly is ON (defined further below)
+local startMassless, stopMassless
+
 local function setFly(state)
     if state == flying then
         return
@@ -1104,11 +1175,26 @@ local function setFly(state)
 
         flying = true
 
+        simTimer = SIM_INTERVAL
+        comTimer = 0
+        stabTimer = 0
+        lastSeatedState = nil
+
+        startMassless()
+        flyConn = RunService.Heartbeat:Connect(flyStep)
+
     else
         local wasSeated = isSeated()
 
         flying = false
         clearKeys()
+
+        if flyConn then
+            flyConn:Disconnect()
+            flyConn = nil
+        end
+
+        stopMassless()
 
         removeFlyPhysics()
 
@@ -1169,20 +1255,8 @@ local function updateStatus(seated)
 end
 
 --==================================================
--- SINGLE HEARTBEAT LOOP (network + status + fly)
+-- UI LOOP (always) + FLY LOOP (only while flying)
 --==================================================
-
-local statusTimer = 0
-local highlightTimer = 0
-local simTimer = 0
-local comTimer = 0
-local stabTimer = 0
-local lastSeatedState = nil
-
-local SIM_INTERVAL = 0.25
-local COM_INTERVAL = 0.2
-local STAB_INTERVAL = 1 / 30
-local HIGHLIGHT_INTERVAL = 0.05
 
 -- Camera cached; refreshed only when Workspace.CurrentCamera changes
 local camera = Workspace.CurrentCamera
@@ -1191,30 +1265,15 @@ connect(Workspace:GetPropertyChangedSignal("CurrentCamera"), function()
     camera = Workspace.CurrentCamera
 end)
 
+-- Light UI loop: status text + seat-picker highlight
 connect(RunService.Heartbeat, function(dt)
-    -- Simulation radius (executor only)
-    if setHidden then
-        simTimer += dt
-
-        if simTimer >= SIM_INTERVAL then
-            simTimer = 0
-            pcall(setHidden, LP, "SimulationRadius", mathHuge)
-        end
-    end
-
-    -- isSeated() is evaluated at most once per frame
-    local seated
-
-    -- Status label (every 0.2s)
     statusTimer += dt
 
-    if statusTimer >= 0.2 then
+    if statusTimer >= STATUS_INTERVAL then
         statusTimer = 0
-        seated = isSeated()
-        updateStatus(seated)
+        updateStatus(isSeated())
     end
 
-    -- Keep the highlight in sync (20 Hz)
     if seatPickerEnabled then
         highlightTimer += dt
 
@@ -1223,10 +1282,22 @@ connect(RunService.Heartbeat, function(dt)
             refreshHighlight()
         end
     end
+end)
 
-    -- Fly movement
+-- Fly loop: connected in setFly(true), disconnected in setFly(false)
+flyStep = function(dt)
     if not flying then
         return
+    end
+
+    -- Simulation radius (executor only)
+    if setHidden then
+        simTimer += dt
+
+        if simTimer >= SIM_INTERVAL then
+            simTimer = 0
+            pcall(setHidden, LP, "SimulationRadius", mathHuge)
+        end
     end
 
     if not root or not root.Parent
@@ -1263,9 +1334,7 @@ connect(RunService.Heartbeat, function(dt)
         direction = direction.Unit
     end
 
-    if seated == nil then
-        seated = isSeated()
-    end
+    local seated = isSeated()
 
     -- Re-read center of mass only on seat change or every COM_INTERVAL
     local force = lastSeatedState ~= seated
@@ -1310,26 +1379,24 @@ connect(RunService.Heartbeat, function(dt)
         stabilizeAssembly(assembly, seated, stabTimer)
         stabTimer = 0
     end
-end)
+end
 
 --==================================================
 -- KEYBOARD
 --==================================================
 
-local FLY_TOGGLE_KEY = KC.F
+local FLY_TOGGLE_KEY = CONFIG.KEYS.FLY
+local SEAT_TOGGLE_KEY = CONFIG.KEYS.SEAT_PICKER
+local EXIT_SEAT_KEY = CONFIG.KEYS.EXIT_SEAT
 
-local keyMap = {
-    [KC.W] = "W",
-    [KC.A] = "A",
-    [KC.S] = "S",
-    [KC.D] = "D",
+-- key code -> movement action
+local keyMap = {}
 
-    [KC.Space] = "Up",
-    [KC.LeftShift] = "Down",
-    [KC.RightShift] = "Down",
-    [KC.LeftControl] = "Down",
-    [KC.RightControl] = "Down",
-}
+for action, codes in pairs(CONFIG.MOVE_KEYS) do
+    for _, code in ipairs(codes) do
+        keyMap[code] = action
+    end
+end
 
 connect(UIS.InputBegan, function(input, processed)
     if processed then return end
@@ -1337,6 +1404,21 @@ connect(UIS.InputBegan, function(input, processed)
     -- PC hotkey: toggle fly
     if input.KeyCode == FLY_TOGGLE_KEY then
         setFly(not flying)
+        return
+    end
+
+    -- PC hotkey: toggle Seat Picker
+    if input.KeyCode == SEAT_TOGGLE_KEY then
+        setSeatPicker(not seatPickerEnabled)
+        return
+    end
+
+    -- PC hotkey: exit seat
+    if input.KeyCode == EXIT_SEAT_KEY then
+        if currentSeat or pendingSeat or isSeated() then
+            exitSeat()
+        end
+
         return
     end
 
@@ -1382,9 +1464,8 @@ mobile.Parent = gui
 
 local BUTTON_SIZE = UDim2.fromOffset(48, 42)
 
-local function holdButton(name, text, key, x, y)
+local function holdButton(text, key, x, y)
     local b = createButton(
-        name,
         text,
         BUTTON_SIZE,
         UDim2.fromOffset(x, y),
@@ -1401,12 +1482,12 @@ local function holdButton(name, text, key, x, y)
     end)
 end
 
-holdButton("Forward", "W", "W", 56, 0)
-holdButton("Left", "A", "A", 4, 47)
-holdButton("Backward", "S", "S", 56, 47)
-holdButton("Right", "D", "D", 108, 47)
-holdButton("Up", "UP", "Up", 30, 94)
-holdButton("Down", "DOWN", "Down", 82, 94)
+holdButton("W", "W", 56, 0)
+holdButton("A", "A", 4, 47)
+holdButton("S", "S", 56, 47)
+holdButton("D", "D", 108, 47)
+holdButton("UP", "Up", 30, 94)
+holdButton("DOWN", "Down", 82, 94)
 
 --==================================================
 -- CUSTOM DRAG (replaces deprecated Frame.Draggable)
@@ -1500,6 +1581,8 @@ end)
 --==================================================
 
 connect(LP.CharacterAdded, function()
+    sitToken += 1
+
     setFly(false)
 
     cleanupSeat(false)
@@ -1507,19 +1590,21 @@ connect(LP.CharacterAdded, function()
 end)
 
 --==================================================
--- NEARBY MASSLESS (N parts per second, no whole-map scan)
+-- NEARBY MASSLESS (only while fly is ON; N parts per second)
 --==================================================
 -- Natural Disaster Survival rebuilds the whole map every round and unanchors
 -- parts during disasters, so a global part list / DescendantAdded hook would
 -- spike on every map load. Instead a native spatial query around the player
 -- finds candidates, and only unanchored, non-massless parts are touched.
 
-local MASSLESS_PER_SECOND = 25   -- set to 50 for a faster rollout
-local MASSLESS_RADIUS = 120      -- studs around the player
-local MASSLESS_QUERY_MAX = 500   -- hard cap on parts returned per query
+local MASSLESS_PER_SECOND = CONFIG.MASSLESS.PER_SECOND
+local MASSLESS_RADIUS = CONFIG.MASSLESS.RADIUS
+local MASSLESS_QUERY_MAX = CONFIG.MASSLESS.QUERY_MAX
+local MASSLESS_INTERVAL = CONFIG.INTERVALS.MASSLESS
 
 local massChanged = setmetatable({}, { __mode = "k" })  -- parts we changed
 local massAlive = false
+local massGen = 0
 
 local massParams = OverlapParams.new()
 massParams.MaxParts = MASSLESS_QUERY_MAX
@@ -1571,23 +1656,27 @@ local function massBatch()
     end
 end
 
-local function startMassless()
+function startMassless()
     if massAlive then
         return
     end
 
     massAlive = true
+    massGen += 1
+
+    -- A stale loop from a quick off/on toggle exits via the generation check
+    local gen = massGen
 
     task.spawn(function()
-        while massAlive do
+        while massAlive and gen == massGen do
             massBatch()
-            taskWait(1)
+            taskWait(MASSLESS_INTERVAL)
         end
     end)
 end
 
 -- Restores Massless on the parts this script changed
-local function stopMassless()
+function stopMassless()
     massAlive = false
 
     for part in pairs(massChanged) do
@@ -1655,9 +1744,6 @@ end
 -- START
 --==================================================
 
-setSeatPicker(true)
-
 updateGUI()
-startMassless()
 
 print("[Unified Fly + Seat Picker] Loaded")
