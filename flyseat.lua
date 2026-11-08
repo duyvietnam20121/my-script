@@ -1,4 +1,4 @@
--- Unified Fly + Seat Picker
+-- FlySeat: fly + seat picker
 
 --==================================================
 -- SERVICES
@@ -82,14 +82,36 @@ local CONFIG = {
         MIN = 10,
         MAX = 250,
         STEP = 10,
+        SEATED_CAP = 80,  -- max speed while seated on a part (raise toward MAX for stronger control)
+        SMOOTHING = 12,   -- acceleration easing (1/s); higher = snappier, 0 = instant. Smoother = less riders jitter
+    },
+
+    SEAT = {
+        KEEP_SEATED = true,  -- if the humanoid leaves the picked seat by itself, sit back down (exit only with E / button)
+    },
+
+    -- Hold the part in place when idle (pulls it back after being pushed)
+    HOLD = {
+        ENABLED = true,
+        DELAY = 0.15,          -- seconds without input before holding
+        RESPONSIVENESS = 60,
+        MAX_SPEED = 120,       -- studs/second used to snap back
+    },
+
+    -- Make nearby players non-collidable locally so they can't push the part
+    PUSH = {
+        ENABLED = true,
+        RADIUS = 60,           -- studs around you
+        REFRESH = 0.25,        -- seconds between nearby-player refreshes
     },
 
     -- Seconds between updates
     INTERVALS = {
         STATUS = 0.2,          -- status text
         HIGHLIGHT = 0.05,      -- Seat Picker highlight
-        SIM_RADIUS = 0.25,     -- SimulationRadius write (while flying)
+        SIM_RADIUS = 0.1,      -- SimulationRadius write (while flying)
         CENTER_OF_MASS = 0.2,  -- assembly center-of-mass re-read (while flying)
+        CENTER_OF_MASS_SEATED = 0.02,  -- same, but while seated (riders move the center of mass)
         STABILIZE = 1 / 30,    -- anti tilt / anti spin (while flying)
         MASSLESS = 1,          -- Massless pass (while flying)
     },
@@ -161,6 +183,7 @@ end
 --==================================================
 
 local FREEZE_PART = false
+local KEEP_SEATED = CONFIG.SEAT.KEEP_SEATED
 
 -- Fly
 local speed = CONFIG.SPEED.DEFAULT
@@ -169,7 +192,7 @@ local maxSpeed = CONFIG.SPEED.MAX
 local speedStep = CONFIG.SPEED.STEP
 
 -- Seated speed
-local SEATED_SPEED_CAP = 80
+local SEATED_SPEED_CAP = CONFIG.SPEED.SEATED_CAP
 
 -- Upright
 local UPRIGHT_RESPONSIVENESS = 65
@@ -205,6 +228,9 @@ local humanoid = nil
 local attachment = nil
 local velocity = nil
 local orientation = nil
+local alignPos = nil   -- holds position while idle
+local holding = false
+local idleTimer = 0
 
 local oldAutoRotate = nil
 local lastYaw = 0
@@ -439,7 +465,7 @@ local GREY = Color3.fromRGB(180, 180, 190)
 
 createLabel(
     UDim2.new(1, 0, 0, 27), UDim2.new(),
-    "FLY + SEAT PICKER",
+    "FLYSEAT",
     Enum.Font.GothamBold, 12, WHITE, main
 )
 
@@ -686,6 +712,21 @@ local function setupStandUpListener(hum, obj)
                 return
             end
 
+            if KEEP_SEATED and obj.Parent then
+                -- Left the seat unexpectedly: sit back down instead of falling off
+                if obj:IsA("Seat") then
+                    pcall(obj.Sit, obj, hum)
+                else
+                    pcall(function()
+                        hum.Sit = true
+
+                        hum:ChangeState(HState.Seated)
+                    end)
+                end
+
+                return
+            end
+
             cleanupSeat(false)
         end)
     end)
@@ -694,6 +735,17 @@ end
 --==================================================
 -- ORIGINAL SEAT LOGIC v3
 --==================================================
+
+-- Short on-screen notice (status label) explaining why a pick was refused
+local notice = nil
+local noticeUntil = 0
+
+local function notify(text)
+    notice = text
+    noticeUntil = os.clock() + 2.5
+
+    warn("[FlySeat] " .. text)
+end
 
 -- Monotonic token: bumping it cancels any in-flight sitOnPart
 local sitToken = 0
@@ -728,7 +780,12 @@ local function sitOnPart(part)
 
     if not (hum and rootPart) then return end
 
-    if not part or not part.Parent or part.Anchored then
+    if not part or not part.Parent then
+        return
+    end
+
+    if part.Anchored then
+        notify("ANCHORED - PICK AN UNANCHORED PART")
         return
     end
 
@@ -738,7 +795,7 @@ local function sitOnPart(part)
 
     -- Prevent sitting on another real game seat
     if hum.SeatPart and hum.SeatPart ~= currentSeat then
-        warn("[Unified] Stand up from the current game seat first.")
+        notify("STAND UP FROM THE GAME SEAT FIRST")
         return
     end
 
@@ -833,12 +890,12 @@ local function sitOnPart(part)
 
         clearHighlight()
 
-        print("[Unified] Sit successful (Seat:Sit)")
+        print("[FlySeat] Sit successful (Seat:Sit)")
         return
     end
 
     -- METHOD 2: ORIGINAL WELD FALLBACK
-    print("[Unified] Seat:Sit failed -> Weld fallback")
+    print("[FlySeat] Seat:Sit failed -> Weld fallback")
 
     seat:Destroy()
     pendingSeat = nil
@@ -921,7 +978,7 @@ local function sitOnPart(part)
 
     clearHighlight()
 
-    print("[Unified] Sit successful (Weld)")
+    print("[FlySeat] Sit successful (Weld)")
 end
 
 --==================================================
@@ -933,7 +990,7 @@ local function exitSeat()
     sitToken += 1
     cleanupSeat(true)
 
-    print("[Unified] Exit seat requested")
+    print("[FlySeat] Exit seat requested")
 end
 
 --==================================================
@@ -999,11 +1056,16 @@ end
 local function removeFlyPhysics()
     if velocity then pcall(velocity.Destroy, velocity) end
     if orientation then pcall(orientation.Destroy, orientation) end
+    if alignPos then pcall(alignPos.Destroy, alignPos) end
     if attachment then pcall(attachment.Destroy, attachment) end
 
     velocity = nil
     orientation = nil
+    alignPos = nil
     attachment = nil
+
+    holding = false
+    idleTimer = 0
 
     lastVel = nil
     lastAppliedYaw = nil
@@ -1083,6 +1145,20 @@ local function createFlyPhysics()
     orientation.Enabled = true
     orientation.Parent = root
 
+    alignPos = Instance.new("AlignPosition")
+    alignPos.Name = randomName()
+
+    alignPos.Mode = Enum.PositionAlignmentMode.OneAttachment
+    alignPos.Attachment0 = attachment
+
+    alignPos.RigidityEnabled = false
+    alignPos.MaxForce = mathHuge
+    alignPos.MaxVelocity = CONFIG.HOLD.MAX_SPEED
+    alignPos.Responsiveness = CONFIG.HOLD.RESPONSIVENESS
+
+    alignPos.Enabled = false
+    alignPos.Parent = root
+
     lastYaw = getFlatYaw(root.CFrame)
 
     lastVel = VEC_ZERO
@@ -1130,12 +1206,17 @@ local simTimer = 0
 local comTimer = 0
 local stabTimer = 0
 local lastSeatedState = nil
+local smoothVel = Vector3.zero
 
 local STATUS_INTERVAL = CONFIG.INTERVALS.STATUS
 local SIM_INTERVAL = CONFIG.INTERVALS.SIM_RADIUS
 local COM_INTERVAL = CONFIG.INTERVALS.CENTER_OF_MASS
+local COM_INTERVAL_SEATED = CONFIG.INTERVALS.CENTER_OF_MASS_SEATED
+local SPEED_SMOOTHING = CONFIG.SPEED.SMOOTHING
 local STAB_INTERVAL = CONFIG.INTERVALS.STABILIZE
 local HIGHLIGHT_INTERVAL = CONFIG.INTERVALS.HIGHLIGHT
+local HOLD_ENABLED = CONFIG.HOLD.ENABLED
+local HOLD_DELAY = CONFIG.HOLD.DELAY
 
 -- The fly loop is connected only while fly is ON (defined further below)
 local flyStep
@@ -1143,6 +1224,9 @@ local flyConn = nil
 
 -- Massless runs only while fly is ON (defined further below)
 local startMassless, stopMassless
+
+-- Anti-push runs only while fly is ON (defined further below)
+local startPushGuard, stopPushGuard
 
 local function setFly(state)
     if state == flying then
@@ -1179,8 +1263,10 @@ local function setFly(state)
         comTimer = 0
         stabTimer = 0
         lastSeatedState = nil
+        smoothVel = VEC_ZERO
 
         startMassless()
+        startPushGuard()
         flyConn = RunService.Heartbeat:Connect(flyStep)
 
     else
@@ -1195,6 +1281,7 @@ local function setFly(state)
         end
 
         stopMassless()
+        stopPushGuard()
 
         removeFlyPhysics()
 
@@ -1231,6 +1318,7 @@ end
 
 local STATUS_BLUE = Color3.fromRGB(100, 180, 255)
 local STATUS_GREEN = Color3.fromRGB(80, 220, 130)
+local STATUS_WARN = Color3.fromRGB(255, 190, 80)
 
 local lastStatus = nil
 
@@ -1245,6 +1333,10 @@ local function updateStatus(seated)
         text, color = "FLYING", STATUS_BLUE
     else
         text, color = "READY", GREY
+    end
+
+    if notice and os.clock() < noticeUntil then
+        text, color = notice, STATUS_WARN
     end
 
     if text ~= lastStatus then
@@ -1297,6 +1389,7 @@ flyStep = function(dt)
         if simTimer >= SIM_INTERVAL then
             simTimer = 0
             pcall(setHidden, LP, "SimulationRadius", mathHuge)
+            pcall(setHidden, LP, "MaximumSimulationRadius", mathHuge)
         end
     end
 
@@ -1310,6 +1403,7 @@ flyStep = function(dt)
 
     if not (velocity and velocity.Parent
         and orientation and orientation.Parent
+        and alignPos and alignPos.Parent
         and attachment and attachment.Parent) then
 
         removeFlyPhysics()
@@ -1342,7 +1436,7 @@ flyStep = function(dt)
 
     comTimer += dt
 
-    if comTimer >= COM_INTERVAL then
+    if comTimer >= (seated and COM_INTERVAL_SEATED or COM_INTERVAL) then
         comTimer = 0
         force = true
     end
@@ -1353,13 +1447,44 @@ flyStep = function(dt)
         return
     end
 
-    -- Speed control
-    local targetVel = direction
+    -- Speed control, eased: abrupt velocity jumps would jerk riders on the part
+    local inputVel = direction
         * (seated and mathMin(speed, SEATED_SPEED_CAP) or speed)
 
-    if targetVel ~= lastVel then
-        velocity.VectorVelocity = targetVel
-        lastVel = targetVel
+    local wanted = inputVel.Magnitude
+
+    local ease = SPEED_SMOOTHING > 0 and (1 - mathExp(-SPEED_SMOOTHING * dt)) or 1
+
+    smoothVel = smoothVel:Lerp(inputVel, ease)
+
+    if wanted < 0.01 and smoothVel.Magnitude < 0.05 then
+        smoothVel = VEC_ZERO
+    end
+
+    if smoothVel ~= lastVel then
+        velocity.VectorVelocity = smoothVel
+        lastVel = smoothVel
+    end
+
+    -- Position hold: while seated and idle, pull the assembly back to where it
+    -- stopped (velocity lock alone lets repeated pushes accumulate as drift)
+    if HOLD_ENABLED and seated and wanted < 0.01 and smoothVel.Magnitude < 1 then
+        idleTimer += dt
+
+        if not holding and idleTimer >= HOLD_DELAY then
+            alignPos.Position = attachment.WorldPosition
+            alignPos.Enabled = true
+            velocity.Enabled = false
+            holding = true
+        end
+    else
+        idleTimer = 0
+
+        if holding then
+            holding = false
+            alignPos.Enabled = false
+            velocity.Enabled = true
+        end
     end
 
     -- Keep assembly upright, only yaw is allowed
@@ -1689,6 +1814,110 @@ function stopMassless()
 end
 
 --==================================================
+-- ANTI-PUSH (only while fly is ON and a part is picked)
+--==================================================
+-- Humanoids re-enable collision on their torso/head/root every physics step,
+-- so nearby players' parts are forced non-collidable each Stepped. This is
+-- local only: it stops *this* client's simulation from being pushed by them.
+
+local PUSH_RADIUS = CONFIG.PUSH.RADIUS
+local PUSH_REFRESH = CONFIG.PUSH.REFRESH
+
+local PUSH_KEY_PARTS = {
+    HumanoidRootPart = true,
+    Head = true,
+    Torso = true,
+    UpperTorso = true,
+    LowerTorso = true,
+}
+
+local pushTargets = {}
+local pushChanged = setmetatable({}, { __mode = "k" })  -- parts we turned non-collidable
+local pushTimer = 0
+local pushConn = nil
+
+local function refreshPushTargets()
+    table.clear(pushTargets)
+
+    local char = LP.Character
+    local myRoot = char and char:FindFirstChild("HumanoidRootPart")
+
+    if not myRoot then
+        return
+    end
+
+    local origin = myRoot.Position
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        local c = plr ~= LP and plr.Character
+        local r = c and c:FindFirstChild("HumanoidRootPart")
+
+        if r and (r.Position - origin).Magnitude <= PUSH_RADIUS then
+            for _, obj in ipairs(c:GetChildren()) do
+                if obj:IsA("BasePart") and (obj.CanCollide or PUSH_KEY_PARTS[obj.Name]) then
+                    pushTargets[#pushTargets + 1] = obj
+                end
+            end
+        end
+    end
+end
+
+local function restorePush()
+    for part in pairs(pushChanged) do
+        pcall(function()
+            part.CanCollide = true
+        end)
+    end
+
+    table.clear(pushChanged)
+    table.clear(pushTargets)
+end
+
+local function pushStep(_, dt)
+    if not currentSeat then
+        if next(pushChanged) then
+            restorePush()
+        end
+
+        return
+    end
+
+    pushTimer += dt
+
+    if pushTimer >= PUSH_REFRESH then
+        pushTimer = 0
+        refreshPushTargets()
+    end
+
+    for i = 1, #pushTargets do
+        local part = pushTargets[i]
+
+        if part.CanCollide then
+            part.CanCollide = false
+            pushChanged[part] = true
+        end
+    end
+end
+
+function startPushGuard()
+    if not CONFIG.PUSH.ENABLED or pushConn then
+        return
+    end
+
+    pushTimer = PUSH_REFRESH
+    pushConn = RunService.Stepped:Connect(pushStep)
+end
+
+function stopPushGuard()
+    if pushConn then
+        pushConn:Disconnect()
+        pushConn = nil
+    end
+
+    restorePush()
+end
+
+--==================================================
 -- GLOBAL CLEANUP
 --==================================================
 
@@ -1700,6 +1929,7 @@ local function fullCleanup()
     cleanupSeat(true)
 
     stopMassless()
+    stopPushGuard()
 
     if highlight then
         pcall(highlight.Destroy, highlight)
@@ -1746,4 +1976,4 @@ end
 
 updateGUI()
 
-print("[Unified Fly + Seat Picker] Loaded")
+print("[FlySeat] Loaded")
