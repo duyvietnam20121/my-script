@@ -73,7 +73,7 @@ local CONFIG = {
         S = { KC.S },
         D = { KC.D },
         Up = { KC.Space },
-        Down = { KC.LeftShift, KC.RightShift, KC.LeftControl, KC.RightControl },
+        Down = { KC.LeftControl, KC.RightControl },
     },
 
     -- Fly speed (studs/second)
@@ -83,26 +83,46 @@ local CONFIG = {
         MAX = 250,
         STEP = 10,
         SEATED_CAP = 80,  -- max speed while seated on a part (raise toward MAX for stronger control)
-        SMOOTHING = 12,   -- acceleration easing (1/s); higher = snappier, 0 = instant. Smoother = less riders jitter
+        SMOOTHING = 8,    -- acceleration easing (1/s); higher = snappier, 0 = instant. Smoother = less riders jitter
     },
 
     SEAT = {
         KEEP_SEATED = true,  -- if the humanoid leaves the picked seat by itself, sit back down (exit only with E / button)
+        SUSPEND_PICKER = true,  -- pause the Seat Picker while seated; it comes back on exit
+        ROTATE_WITH_CAMERA = false,  -- seated: false keeps the part's heading fixed so riders aren't spun around
     },
 
     -- Hold the part in place when idle (pulls it back after being pushed)
     HOLD = {
         ENABLED = true,
         DELAY = 0.15,          -- seconds without input before holding
-        RESPONSIVENESS = 60,
-        MAX_SPEED = 120,       -- studs/second used to snap back
+        RESPONSIVENESS = 100,
+        MAX_SPEED = 200,       -- studs/second used to snap back
+    },
+
+    -- Make the picked part (and its welded parts) feather-light while seated.
+    -- Heavy parts are what makes them sag / fall; density is restored on exit.
+    LIGHTEN = {
+        ENABLED = true,
+        TARGET_MASS = 0.1,      -- heavy parts are brought down to about this mass (never lighter than needed)
+        MIN_DENSITY = 0.01,    -- lowest density Roblox allows
+        MAX_PARTS = 40,        -- connected parts handled per pick
+
+        -- Also lighten every loose part around you while seated
+        NEARBY = {
+            ENABLED = true,
+            RADIUS = 40,       -- studs around you
+            INTERVAL = 1,      -- seconds between passes
+            PER_PASS = 25,     -- parts lightened per pass
+            QUERY_MAX = 1000,  -- hard cap on parts returned per query
+        },
     },
 
     -- Make nearby players non-collidable locally so they can't push the part
     PUSH = {
         ENABLED = true,
-        RADIUS = 60,           -- studs around you
-        REFRESH = 0.25,        -- seconds between nearby-player refreshes
+        RADIUS = 50,           -- studs around you
+        REFRESH = 0.1,        -- seconds between nearby-player refreshes
     },
 
     -- Seconds between updates
@@ -113,14 +133,6 @@ local CONFIG = {
         CENTER_OF_MASS = 0.2,  -- assembly center-of-mass re-read (while flying)
         CENTER_OF_MASS_SEATED = 0.02,  -- same, but while seated (riders move the center of mass)
         STABILIZE = 1 / 30,    -- anti tilt / anti spin (while flying)
-        MASSLESS = 1,          -- Massless pass (while flying)
-    },
-
-    -- Massless pass
-    MASSLESS = {
-        PER_SECOND = 25,   -- parts handled per pass (50 = faster rollout)
-        RADIUS = 120,      -- studs around the player
-        QUERY_MAX = 500,   -- hard cap on parts returned per query
     },
 }
 
@@ -130,6 +142,7 @@ local LABELS = {
     FLY_OFF = ("FLY [%s]: OFF"):format(CONFIG.KEYS.FLY.Name),
     SEAT_ON = ("SEAT PICKER [%s]: ON"):format(CONFIG.KEYS.SEAT_PICKER.Name),
     SEAT_OFF = ("SEAT PICKER [%s]: OFF"):format(CONFIG.KEYS.SEAT_PICKER.Name),
+    SEAT_PAUSED = ("SEAT PICKER [%s]: PAUSED"):format(CONFIG.KEYS.SEAT_PICKER.Name),
     EXIT = ("EXIT SEAT [%s]"):format(CONFIG.KEYS.EXIT_SEAT.Name),
 }
 
@@ -184,6 +197,8 @@ end
 
 local FREEZE_PART = false
 local KEEP_SEATED = CONFIG.SEAT.KEEP_SEATED
+local SUSPEND_PICKER = CONFIG.SEAT.SUSPEND_PICKER
+local ROTATE_SEATED = CONFIG.SEAT.ROTATE_WITH_CAMERA
 
 -- Fly
 local speed = CONFIG.SPEED.DEFAULT
@@ -195,8 +210,8 @@ local speedStep = CONFIG.SPEED.STEP
 local SEATED_SPEED_CAP = CONFIG.SPEED.SEATED_CAP
 
 -- Upright
-local UPRIGHT_RESPONSIVENESS = 65
-local UPRIGHT_MAX_TORQUE = 1000000000
+local UPRIGHT_RESPONSIVENESS = 100
+local UPRIGHT_MAX_TORQUE = mathHuge
 local UPRIGHT_MAX_ANGULAR = 120
 
 -- Anti spin
@@ -220,6 +235,10 @@ local currentSeat = nil
 local pendingSeat = nil
 local charWeldInst = nil
 
+-- Seat Picker is paused while seated (functions are defined after setSeatPicker)
+local pickerSuspended = false
+local suspendPicker, resumePicker
+
 local highlight = nil
 
 local root = nil
@@ -234,6 +253,7 @@ local idleTimer = 0
 
 local oldAutoRotate = nil
 local lastYaw = 0
+local seatYaw = 0  -- heading kept while seated (riders are not spun by camera turns)
 
 -- Last values written to the fly constraints (skip redundant writes)
 local lastVel = nil
@@ -348,7 +368,7 @@ pcall(function()
     LP.ReplicationFocus = Workspace
 end)
 
--- Resolved once; used by the fly loop (SimulationRadius) and Massless
+-- Resolved once; used by the fly loop (SimulationRadius)
 local setHidden = type(sethiddenproperty) == "function"
     and sethiddenproperty
     or nil
@@ -531,7 +551,8 @@ local function updateGUI()
     flyButton.Text = flying and LABELS.FLY_ON or LABELS.FLY_OFF
     flyButton.BackgroundColor3 = flying and COLOR_ON or COLOR_OFF
 
-    seatButton.Text = seatPickerEnabled and LABELS.SEAT_ON or LABELS.SEAT_OFF
+    seatButton.Text = seatPickerEnabled and LABELS.SEAT_ON
+        or (pickerSuspended and LABELS.SEAT_PAUSED or LABELS.SEAT_OFF)
     seatButton.BackgroundColor3 = seatPickerEnabled and COLOR_ON or COLOR_OFF
 
     speedLabel.Text = tostring(speed)
@@ -621,6 +642,130 @@ end
 -- SEAT CLEANUP
 --==================================================
 
+-- Parts made light: part -> original CustomPhysicalProperties (false = default)
+local lightened = {}
+local lightenSeen = setmetatable({}, { __mode = "k" })  -- parts already evaluated
+
+local function restoreLightened()
+    for part, original in pairs(lightened) do
+        pcall(function()
+            part.CustomPhysicalProperties = original or nil
+        end)
+    end
+
+    table.clear(lightened)
+    table.clear(lightenSeen)
+end
+
+-- Brings one loose part down to the target mass. Returns true if it changed.
+-- Parts already lighter than the target are left alone: a part that is too
+-- light reacts violently to riders (they slide / it jitters).
+local function lightenOne(p, cfg)
+    if lightenSeen[p] or p.Anchored then
+        return false
+    end
+
+    lightenSeen[p] = true
+
+    local cur = p.CurrentPhysicalProperties
+    local volume = p.Size.X * p.Size.Y * p.Size.Z
+    local density = mathClamp(cfg.TARGET_MASS / volume, cfg.MIN_DENSITY, 100)
+
+    if density >= cur.Density then
+        return false
+    end
+
+    lightened[p] = p.CustomPhysicalProperties or false
+
+    pcall(function()
+        p.CustomPhysicalProperties = PhysicalProperties.new(
+            density,
+            cur.Friction,
+            cur.Elasticity,
+            cur.FrictionWeight,
+            cur.ElasticityWeight
+        )
+    end)
+
+    return true
+end
+
+-- The picked part and the parts welded to it (never characters)
+local function lightenPart(part)
+    local cfg = CONFIG.LIGHTEN
+
+    if not cfg.ENABLED then
+        return
+    end
+
+    local list = { part }
+    local ok, connected = pcall(part.GetConnectedParts, part, true)
+
+    if ok then
+        for _, p in ipairs(connected) do
+            if p ~= part and #list < cfg.MAX_PARTS then
+                local model = p.Parent
+
+                if not (model and model:FindFirstChildOfClass("Humanoid")) then
+                    list[#list + 1] = p
+                end
+            end
+        end
+    end
+
+    for _, p in ipairs(list) do
+        lightenOne(p, cfg)
+    end
+end
+
+-- Every loose part within NEARBY.RADIUS studs of the player (never characters)
+local nearbyParams = OverlapParams.new()
+nearbyParams.MaxParts = CONFIG.LIGHTEN.NEARBY.QUERY_MAX
+
+local function lightenNearby()
+    local cfg = CONFIG.LIGHTEN
+    local nearby = cfg.NEARBY
+
+    local char = LP.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+
+    if not hrp then
+        return
+    end
+
+    local ok, parts = pcall(
+        Workspace.GetPartBoundsInRadius,
+        Workspace,
+        hrp.Position,
+        nearby.RADIUS,
+        nearbyParams
+    )
+
+    if not ok then
+        return
+    end
+
+    local changed = 0
+
+    for i = 1, #parts do
+        local p = parts[i]
+
+        if not lightenSeen[p] and not p.Anchored then
+            local model = p.Parent
+
+            if not (model and model:FindFirstChildOfClass("Humanoid")) then
+                if lightenOne(p, cfg) then
+                    changed += 1
+
+                    if changed >= nearby.PER_PASS then
+                        break
+                    end
+                end
+            end
+        end
+    end
+end
+
 local function cleanupSeat(resetHumanoid)
     if seatStateConnection then
         seatStateConnection:Disconnect()
@@ -655,6 +800,8 @@ local function cleanupSeat(resetHumanoid)
         pcall(tempSeat.Destroy, tempSeat)
     end
 
+    restoreLightened()
+
     if charWeldInst then
         pcall(charWeldInst.Destroy, charWeldInst)
         charWeldInst = nil
@@ -671,6 +818,10 @@ local function cleanupSeat(resetHumanoid)
                 hum:ChangeState(HState.GettingUp)
             end)
         end
+    end
+
+    if pickerSuspended then
+        resumePicker()
     end
 end
 
@@ -890,6 +1041,12 @@ local function sitOnPart(part)
 
         clearHighlight()
 
+        if SUSPEND_PICKER then
+            suspendPicker()
+        end
+
+        lightenPart(part)
+
         print("[FlySeat] Sit successful (Seat:Sit)")
         return
     end
@@ -978,6 +1135,12 @@ local function sitOnPart(part)
 
     clearHighlight()
 
+    if SUSPEND_PICKER then
+        suspendPicker()
+    end
+
+    lightenPart(part)
+
     print("[FlySeat] Sit successful (Weld)")
 end
 
@@ -998,6 +1161,9 @@ end
 --==================================================
 
 local function setSeatPicker(state)
+    -- Any explicit toggle ends the automatic pause
+    pickerSuspended = false
+
     if seatPickerEnabled == state then
         return
     end
@@ -1047,6 +1213,24 @@ local function setSeatPicker(state)
     end
 
     updateGUI()
+end
+
+-- Pauses the picker after a successful pick; resumed when the seat is released
+suspendPicker = function()
+    if not seatPickerEnabled then
+        return
+    end
+
+    setSeatPicker(false)
+    pickerSuspended = true
+
+    updateGUI()
+end
+
+resumePicker = function()
+    if pickerSuspended then
+        setSeatPicker(true)
+    end
 end
 
 --==================================================
@@ -1202,6 +1386,7 @@ end
 
 local statusTimer = 0
 local highlightTimer = 0
+local nearbyTimer = 0
 local simTimer = 0
 local comTimer = 0
 local stabTimer = 0
@@ -1221,9 +1406,6 @@ local HOLD_DELAY = CONFIG.HOLD.DELAY
 -- The fly loop is connected only while fly is ON (defined further below)
 local flyStep
 local flyConn = nil
-
--- Massless runs only while fly is ON (defined further below)
-local startMassless, stopMassless
 
 -- Anti-push runs only while fly is ON (defined further below)
 local startPushGuard, stopPushGuard
@@ -1265,7 +1447,6 @@ local function setFly(state)
         lastSeatedState = nil
         smoothVel = VEC_ZERO
 
-        startMassless()
         startPushGuard()
         flyConn = RunService.Heartbeat:Connect(flyStep)
 
@@ -1280,7 +1461,6 @@ local function setFly(state)
             flyConn = nil
         end
 
-        stopMassless()
         stopPushGuard()
 
         removeFlyPhysics()
@@ -1374,6 +1554,18 @@ connect(RunService.Heartbeat, function(dt)
             refreshHighlight()
         end
     end
+
+    -- Lighten loose parts around you while a part is picked
+    if currentSeat and CONFIG.LIGHTEN.ENABLED and CONFIG.LIGHTEN.NEARBY.ENABLED then
+        nearbyTimer += dt
+
+        if nearbyTimer >= CONFIG.LIGHTEN.NEARBY.INTERVAL then
+            nearbyTimer = 0
+            lightenNearby()
+        end
+    else
+        nearbyTimer = CONFIG.LIGHTEN.NEARBY.INTERVAL
+    end
 end)
 
 -- Fly loop: connected in setFly(true), disconnected in setFly(false)
@@ -1432,6 +1624,16 @@ flyStep = function(dt)
 
     -- Re-read center of mass only on seat change or every COM_INTERVAL
     local force = lastSeatedState ~= seated
+
+    -- Capture the heading the moment we become seated
+    if seated and not lastSeatedState then
+        local look = root.CFrame.LookVector
+
+        if look.X * look.X + look.Z * look.Z > 0.000001 then
+            seatYaw = mathAtan2(-look.X, -look.Z)
+        end
+    end
+
     lastSeatedState = seated
 
     comTimer += dt
@@ -1490,6 +1692,10 @@ flyStep = function(dt)
     -- Keep assembly upright, only yaw is allowed
     if orientation then
         local yaw = getFlatYaw(cf)
+
+        if seated and not ROTATE_SEATED then
+            yaw = seatYaw
+        end
 
         if yaw ~= lastAppliedYaw then
             orientation.CFrame = CFAngles(0, yaw, 0)
@@ -1715,105 +1921,6 @@ connect(LP.CharacterAdded, function()
 end)
 
 --==================================================
--- NEARBY MASSLESS (only while fly is ON; N parts per second)
---==================================================
--- Natural Disaster Survival rebuilds the whole map every round and unanchors
--- parts during disasters, so a global part list / DescendantAdded hook would
--- spike on every map load. Instead a native spatial query around the player
--- finds candidates, and only unanchored, non-massless parts are touched.
-
-local MASSLESS_PER_SECOND = CONFIG.MASSLESS.PER_SECOND
-local MASSLESS_RADIUS = CONFIG.MASSLESS.RADIUS
-local MASSLESS_QUERY_MAX = CONFIG.MASSLESS.QUERY_MAX
-local MASSLESS_INTERVAL = CONFIG.INTERVALS.MASSLESS
-
-local massChanged = setmetatable({}, { __mode = "k" })  -- parts we changed
-local massAlive = false
-local massGen = 0
-
-local massParams = OverlapParams.new()
-massParams.MaxParts = MASSLESS_QUERY_MAX
-
-local function applyMassless(part)
-    -- sethiddenproperty first; plain assignment if the executor rejects it
-    if not (setHidden and pcall(setHidden, part, "Massless", true)) then
-        pcall(function()
-            part.Massless = true
-        end)
-    end
-
-    massChanged[part] = true
-end
-
-local function massBatch()
-    local char = LP.Character
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-
-    if not hrp then
-        return
-    end
-
-    local ok, parts = pcall(
-        Workspace.GetPartBoundsInRadius,
-        Workspace,
-        hrp.Position,
-        MASSLESS_RADIUS,
-        massParams
-    )
-
-    if not ok then
-        return
-    end
-
-    local applied = 0
-
-    for i = 1, #parts do
-        local part = parts[i]
-
-        if not part.Anchored and not part.Massless then
-            applyMassless(part)
-            applied += 1
-
-            if applied >= MASSLESS_PER_SECOND then
-                break
-            end
-        end
-    end
-end
-
-function startMassless()
-    if massAlive then
-        return
-    end
-
-    massAlive = true
-    massGen += 1
-
-    -- A stale loop from a quick off/on toggle exits via the generation check
-    local gen = massGen
-
-    task.spawn(function()
-        while massAlive and gen == massGen do
-            massBatch()
-            taskWait(MASSLESS_INTERVAL)
-        end
-    end)
-end
-
--- Restores Massless on the parts this script changed
-function stopMassless()
-    massAlive = false
-
-    for part in pairs(massChanged) do
-        pcall(function()
-            part.Massless = false
-        end)
-    end
-
-    table.clear(massChanged)
-end
-
---==================================================
 -- ANTI-PUSH (only while fly is ON and a part is picked)
 --==================================================
 -- Humanoids re-enable collision on their torso/head/root every physics step,
@@ -1928,7 +2035,6 @@ local function fullCleanup()
 
     cleanupSeat(true)
 
-    stopMassless()
     stopPushGuard()
 
     if highlight then
