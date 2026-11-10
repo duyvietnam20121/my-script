@@ -83,13 +83,13 @@ local CONFIG = {
         MAX = 250,
         STEP = 10,
         SEATED_CAP = 80,  -- max speed while seated on a part (raise toward MAX for stronger control)
-        SMOOTHING = 8,    -- acceleration easing (1/s); higher = snappier, 0 = instant. Smoother = less riders jitter
+        SMOOTHING = 5,    -- acceleration easing (1/s); higher = snappier, 0 = instant. Smoother = less riders jitter
     },
 
     SEAT = {
         KEEP_SEATED = true,  -- if the humanoid leaves the picked seat by itself, sit back down (exit only with E / button)
         SUSPEND_PICKER = true,  -- pause the Seat Picker while seated; it comes back on exit
-        ROTATE_WITH_CAMERA = false,  -- seated: false keeps the part's heading fixed so riders aren't spun around
+        ROTATE_WITH_CAMERA = true,  -- seated: false keeps the part's heading fixed so riders aren't spun around
     },
 
     -- Hold the part in place when idle (pulls it back after being pushed)
@@ -98,15 +98,19 @@ local CONFIG = {
         DELAY = 0.15,          -- seconds without input before holding
         RESPONSIVENESS = 100,
         MAX_SPEED = 200,       -- studs/second used to snap back
+        RIGID = true,          -- hold like a hard weld to the world (ignores RESPONSIVENESS / MAX_SPEED)
+        SNAP_DISTANCE = 8,     -- studs: if the held part is pulled farther than this it is put back (0 = off)
     },
 
     -- Make the picked part (and its welded parts) feather-light while seated.
     -- Heavy parts are what makes them sag / fall; density is restored on exit.
     LIGHTEN = {
         ENABLED = true,
-        TARGET_MASS = 0.1,      -- heavy parts are brought down to about this mass (never lighter than needed)
+        TARGET_MASS = 25,      -- heavy parts are brought down to about this mass (never lighter than needed)
         MIN_DENSITY = 0.01,    -- lowest density Roblox allows
         MAX_PARTS = 40,        -- connected parts handled per pick
+        UNIFORM = false,        -- every lightened part gets MIN_DENSITY (false = only bring heavy parts down to TARGET_MASS)
+        GRAVITY = 0.3,         -- local gravity multiplier while seated (1 = unchanged)
 
         -- Also lighten every loose part around you while seated
         NEARBY = {
@@ -115,14 +119,15 @@ local CONFIG = {
             INTERVAL = 1,      -- seconds between passes
             PER_PASS = 25,     -- parts lightened per pass
             QUERY_MAX = 1000,  -- hard cap on parts returned per query
+            INCLUDE_PLAYERS = true,  -- also other players' parts (local only; your own character is never touched)
         },
     },
 
-    -- Make nearby players non-collidable locally so they can't push the part
+    -- Make nearby players pass through the picked part locally so they can't push it (runs while a part is picked)
     PUSH = {
         ENABLED = true,
-        RADIUS = 50,           -- studs around you
-        REFRESH = 0.1,        -- seconds between nearby-player refreshes
+        RADIUS = 60,           -- studs around you
+        REFRESH = 0.25,        -- seconds between nearby-player refreshes
     },
 
     -- Seconds between updates
@@ -234,6 +239,8 @@ local seatPickerEnabled = false
 local currentSeat = nil
 local pendingSeat = nil
 local charWeldInst = nil
+local pickedPart = nil  -- the part we picked (anti-push pairs collisions against it)
+local startPushGuard, stopPushGuard  -- anti-push, defined further below
 
 -- Seat Picker is paused while seated (functions are defined after setSeatPicker)
 local pickerSuspended = false
@@ -646,6 +653,21 @@ end
 local lightened = {}
 local lightenSeen = setmetatable({}, { __mode = "k" })  -- parts already evaluated
 
+local gravityRestore = nil
+local gravitySet = nil
+
+local function restoreGravity()
+    if gravityRestore then
+        -- Only put it back if the game hasn't changed it meanwhile
+        if gravitySet and mathAbs(Workspace.Gravity - gravitySet) < 0.01 then
+            Workspace.Gravity = gravityRestore
+        end
+
+        gravityRestore = nil
+        gravitySet = nil
+    end
+end
+
 local function restoreLightened()
     for part, original in pairs(lightened) do
         pcall(function()
@@ -655,11 +677,14 @@ local function restoreLightened()
 
     table.clear(lightened)
     table.clear(lightenSeen)
+
+    restoreGravity()
 end
 
--- Brings one loose part down to the target mass. Returns true if it changed.
--- Parts already lighter than the target are left alone: a part that is too
--- light reacts violently to riders (they slide / it jitters).
+-- Lightens one loose part. Returns true if it changed.
+-- UNIFORM: every part gets MIN_DENSITY, so nearby parts all weigh alike
+-- (riders and the part they stand on keep a sane mass ratio).
+-- Otherwise only parts heavier than TARGET_MASS are brought down to it.
 local function lightenOne(p, cfg)
     if lightenSeen[p] or p.Anchored then
         return false
@@ -668,8 +693,13 @@ local function lightenOne(p, cfg)
     lightenSeen[p] = true
 
     local cur = p.CurrentPhysicalProperties
-    local volume = p.Size.X * p.Size.Y * p.Size.Z
-    local density = mathClamp(cfg.TARGET_MASS / volume, cfg.MIN_DENSITY, 100)
+    local density = cfg.MIN_DENSITY
+
+    if not cfg.UNIFORM then
+        local volume = p.Size.X * p.Size.Y * p.Size.Z
+
+        density = mathClamp(cfg.TARGET_MASS / volume, cfg.MIN_DENSITY, 100)
+    end
 
     if density >= cur.Density then
         return false
@@ -716,6 +746,13 @@ local function lightenPart(part)
     for _, p in ipairs(list) do
         lightenOne(p, cfg)
     end
+
+    -- Lower local gravity while seated (restored on exit)
+    if cfg.GRAVITY < 1 and not gravityRestore then
+        gravityRestore = Workspace.Gravity
+        Workspace.Gravity = gravityRestore * cfg.GRAVITY
+        gravitySet = Workspace.Gravity
+    end
 end
 
 -- Every loose part within NEARBY.RADIUS studs of the player (never characters)
@@ -752,8 +789,9 @@ local function lightenNearby()
 
         if not lightenSeen[p] and not p.Anchored then
             local model = p.Parent
+            local isCharacter = model and model:FindFirstChildOfClass("Humanoid")
 
-            if not (model and model:FindFirstChildOfClass("Humanoid")) then
+            if not isCharacter or (nearby.INCLUDE_PLAYERS and model ~= char) then
                 if lightenOne(p, cfg) then
                     changed += 1
 
@@ -801,6 +839,12 @@ local function cleanupSeat(resetHumanoid)
     end
 
     restoreLightened()
+
+    pickedPart = nil
+
+    if stopPushGuard then
+        stopPushGuard()
+    end
 
     if charWeldInst then
         pcall(charWeldInst.Destroy, charWeldInst)
@@ -1045,7 +1089,9 @@ local function sitOnPart(part)
             suspendPicker()
         end
 
+        pickedPart = part
         lightenPart(part)
+        startPushGuard()
 
         print("[FlySeat] Sit successful (Seat:Sit)")
         return
@@ -1139,7 +1185,9 @@ local function sitOnPart(part)
         suspendPicker()
     end
 
+    pickedPart = part
     lightenPart(part)
+    startPushGuard()
 
     print("[FlySeat] Sit successful (Weld)")
 end
@@ -1335,7 +1383,7 @@ local function createFlyPhysics()
     alignPos.Mode = Enum.PositionAlignmentMode.OneAttachment
     alignPos.Attachment0 = attachment
 
-    alignPos.RigidityEnabled = false
+    alignPos.RigidityEnabled = CONFIG.HOLD.RIGID
     alignPos.MaxForce = mathHuge
     alignPos.MaxVelocity = CONFIG.HOLD.MAX_SPEED
     alignPos.Responsiveness = CONFIG.HOLD.RESPONSIVENESS
@@ -1402,13 +1450,11 @@ local STAB_INTERVAL = CONFIG.INTERVALS.STABILIZE
 local HIGHLIGHT_INTERVAL = CONFIG.INTERVALS.HIGHLIGHT
 local HOLD_ENABLED = CONFIG.HOLD.ENABLED
 local HOLD_DELAY = CONFIG.HOLD.DELAY
+local HOLD_SNAP = CONFIG.HOLD.SNAP_DISTANCE
 
 -- The fly loop is connected only while fly is ON (defined further below)
 local flyStep
 local flyConn = nil
-
--- Anti-push runs only while fly is ON (defined further below)
-local startPushGuard, stopPushGuard
 
 local function setFly(state)
     if state == flying then
@@ -1447,7 +1493,6 @@ local function setFly(state)
         lastSeatedState = nil
         smoothVel = VEC_ZERO
 
-        startPushGuard()
         flyConn = RunService.Heartbeat:Connect(flyStep)
 
     else
@@ -1461,7 +1506,6 @@ local function setFly(state)
             flyConn = nil
         end
 
-        stopPushGuard()
 
         removeFlyPhysics()
 
@@ -1678,6 +1722,17 @@ flyStep = function(dt)
             alignPos.Enabled = true
             velocity.Enabled = false
             holding = true
+        end
+
+        -- Safety net: if the held part still got pulled away, put it back
+        if holding and HOLD_SNAP > 0 then
+            local delta = alignPos.Position - attachment.WorldPosition
+
+            if delta.Magnitude > HOLD_SNAP then
+                root.CFrame = root.CFrame + delta
+                root.AssemblyLinearVelocity = VEC_ZERO
+                root.AssemblyAngularVelocity = VEC_ZERO
+            end
         end
     else
         idleTimer = 0
@@ -1921,11 +1976,13 @@ connect(LP.CharacterAdded, function()
 end)
 
 --==================================================
--- ANTI-PUSH (only while fly is ON and a part is picked)
+-- ANTI-PUSH (runs while a part is picked)
 --==================================================
--- Humanoids re-enable collision on their torso/head/root every physics step,
--- so nearby players' parts are forced non-collidable each Stepped. This is
--- local only: it stops *this* client's simulation from being pushed by them.
+-- Two layers, both local to this client's simulation:
+--  1. NoCollisionConstraint between nearby players' main parts and the picked
+--     part. Humanoids never touch these, so they hold.
+--  2. CanCollide = false on those parts every Stepped and Heartbeat, because
+--     Humanoids re-enable collision on their torso / head / root.
 
 local PUSH_RADIUS = CONFIG.PUSH.RADIUS
 local PUSH_REFRESH = CONFIG.PUSH.REFRESH
@@ -1940,11 +1997,20 @@ local PUSH_KEY_PARTS = {
 
 local pushTargets = {}
 local pushChanged = setmetatable({}, { __mode = "k" })  -- parts we turned non-collidable
+local pushPairs = {}   -- their part -> NoCollisionConstraint
 local pushTimer = 0
-local pushConn = nil
+local pushConns = {}
 
 local function refreshPushTargets()
     table.clear(pushTargets)
+
+    -- Drop constraints whose parts are gone
+    for part, constraint in pairs(pushPairs) do
+        if not part.Parent or not constraint.Parent then
+            pcall(constraint.Destroy, constraint)
+            pushPairs[part] = nil
+        end
+    end
 
     local char = LP.Character
     local myRoot = char and char:FindFirstChild("HumanoidRootPart")
@@ -1954,6 +2020,7 @@ local function refreshPushTargets()
     end
 
     local origin = myRoot.Position
+    local created = 0
 
     for _, plr in ipairs(Players:GetPlayers()) do
         local c = plr ~= LP and plr.Character
@@ -1963,6 +2030,29 @@ local function refreshPushTargets()
             for _, obj in ipairs(c:GetChildren()) do
                 if obj:IsA("BasePart") and (obj.CanCollide or PUSH_KEY_PARTS[obj.Name]) then
                     pushTargets[#pushTargets + 1] = obj
+
+                    -- Layer 1: a constraint against the picked part
+                    if pickedPart and pickedPart.Parent
+                        and PUSH_KEY_PARTS[obj.Name]
+                        and not pushPairs[obj]
+                        and created < 20 then
+
+                        local ok, constraint = pcall(function()
+                            local nc = Instance.new("NoCollisionConstraint")
+
+                            nc.Name = randomName()
+                            nc.Part0 = obj
+                            nc.Part1 = pickedPart
+                            nc.Parent = pickedPart
+
+                            return nc
+                        end)
+
+                        if ok then
+                            pushPairs[obj] = constraint
+                            created += 1
+                        end
+                    end
                 end
             end
         end
@@ -1970,19 +2060,36 @@ local function refreshPushTargets()
 end
 
 local function restorePush()
+    for _, constraint in pairs(pushPairs) do
+        pcall(constraint.Destroy, constraint)
+    end
+
     for part in pairs(pushChanged) do
         pcall(function()
             part.CanCollide = true
         end)
     end
 
+    table.clear(pushPairs)
     table.clear(pushChanged)
     table.clear(pushTargets)
 end
 
+-- Layer 2, applied twice per frame (Stepped and Heartbeat)
+local function pushApply()
+    for i = 1, #pushTargets do
+        local part = pushTargets[i]
+
+        if part.CanCollide then
+            part.CanCollide = false
+            pushChanged[part] = true
+        end
+    end
+end
+
 local function pushStep(_, dt)
     if not currentSeat then
-        if next(pushChanged) then
+        if next(pushChanged) or next(pushPairs) then
             restorePush()
         end
 
@@ -1996,30 +2103,26 @@ local function pushStep(_, dt)
         refreshPushTargets()
     end
 
-    for i = 1, #pushTargets do
-        local part = pushTargets[i]
-
-        if part.CanCollide then
-            part.CanCollide = false
-            pushChanged[part] = true
-        end
-    end
+    pushApply()
 end
 
 function startPushGuard()
-    if not CONFIG.PUSH.ENABLED or pushConn then
+    if not CONFIG.PUSH.ENABLED or pushConns[1] then
         return
     end
 
     pushTimer = PUSH_REFRESH
-    pushConn = RunService.Stepped:Connect(pushStep)
+
+    pushConns[1] = RunService.Stepped:Connect(pushStep)
+    pushConns[2] = RunService.Heartbeat:Connect(pushApply)
 end
 
 function stopPushGuard()
-    if pushConn then
-        pushConn:Disconnect()
-        pushConn = nil
+    for i = 1, #pushConns do
+        pushConns[i]:Disconnect()
     end
+
+    table.clear(pushConns)
 
     restorePush()
 end
