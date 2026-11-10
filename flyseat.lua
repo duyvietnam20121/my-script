@@ -83,13 +83,13 @@ local CONFIG = {
         MAX = 250,
         STEP = 10,
         SEATED_CAP = 80,  -- max speed while seated on a part (raise toward MAX for stronger control)
-        SMOOTHING = 5,    -- acceleration easing (1/s); higher = snappier, 0 = instant. Smoother = less riders jitter
+        SMOOTHING = 8,    -- acceleration easing (1/s); higher = snappier, 0 = instant. Smoother = less riders jitter
     },
 
     SEAT = {
         KEEP_SEATED = true,  -- if the humanoid leaves the picked seat by itself, sit back down (exit only with E / button)
         SUSPEND_PICKER = true,  -- pause the Seat Picker while seated; it comes back on exit
-        ROTATE_WITH_CAMERA = true,  -- seated: false keeps the part's heading fixed so riders aren't spun around
+        ROTATE_WITH_CAMERA = false,  -- seated: false keeps the part's heading fixed so riders aren't spun around
     },
 
     -- Hold the part in place when idle (pulls it back after being pushed)
@@ -110,7 +110,7 @@ local CONFIG = {
         MIN_DENSITY = 0.01,    -- lowest density Roblox allows
         MAX_PARTS = 40,        -- connected parts handled per pick
         UNIFORM = false,        -- every lightened part gets MIN_DENSITY (false = only bring heavy parts down to TARGET_MASS)
-        GRAVITY = 0.3,         -- local gravity multiplier while seated (1 = unchanged)
+        ANTI_GRAVITY = true,   -- the picked assembly gets an upward force equal to its weight (weightless)
 
         -- Also lighten every loose part around you while seated
         NEARBY = {
@@ -653,19 +653,53 @@ end
 local lightened = {}
 local lightenSeen = setmetatable({}, { __mode = "k" })  -- parts already evaluated
 
-local gravityRestore = nil
-local gravitySet = nil
+-- Weightless part: an upward VectorForce equal to the assembly's weight
+local antiGen = 0
+local antiObjects = {}
 
-local function restoreGravity()
-    if gravityRestore then
-        -- Only put it back if the game hasn't changed it meanwhile
-        if gravitySet and mathAbs(Workspace.Gravity - gravitySet) < 0.01 then
-            Workspace.Gravity = gravityRestore
-        end
+local function stopAntiGravity()
+    antiGen += 1
 
-        gravityRestore = nil
-        gravitySet = nil
+    for _, obj in ipairs(antiObjects) do
+        pcall(obj.Destroy, obj)
     end
+
+    table.clear(antiObjects)
+end
+
+local function startAntiGravity(part)
+    if not CONFIG.LIGHTEN.ANTI_GRAVITY then
+        return
+    end
+
+    stopAntiGravity()
+
+    local att = Instance.new("Attachment")
+    att.Name = randomName()
+    att.Parent = part
+
+    local force = Instance.new("VectorForce")
+    force.Name = randomName()
+    force.Attachment0 = att
+    force.RelativeTo = Enum.ActuatorRelativeTo.World
+    force.ApplyAtCenterOfMass = true
+    force.Force = VEC_ZERO
+    force.Parent = part
+
+    antiObjects[1] = att
+    antiObjects[2] = force
+
+    local gen = antiGen
+
+    task.spawn(function()
+        while gen == antiGen and currentSeat and part.Parent do
+            pcall(function()
+                force.Force = Vector3.new(0, part.AssemblyMass * Workspace.Gravity, 0)
+            end)
+
+            taskWait(0.25)
+        end
+    end)
 end
 
 local function restoreLightened()
@@ -678,7 +712,7 @@ local function restoreLightened()
     table.clear(lightened)
     table.clear(lightenSeen)
 
-    restoreGravity()
+    stopAntiGravity()
 end
 
 -- Lightens one loose part. Returns true if it changed.
@@ -747,12 +781,8 @@ local function lightenPart(part)
         lightenOne(p, cfg)
     end
 
-    -- Lower local gravity while seated (restored on exit)
-    if cfg.GRAVITY < 1 and not gravityRestore then
-        gravityRestore = Workspace.Gravity
-        Workspace.Gravity = gravityRestore * cfg.GRAVITY
-        gravitySet = Workspace.Gravity
-    end
+    -- Weightless while seated (removed on exit)
+    startAntiGravity(part)
 end
 
 -- Every loose part within NEARBY.RADIUS studs of the player (never characters)
@@ -1613,7 +1643,7 @@ connect(RunService.Heartbeat, function(dt)
 end)
 
 -- Fly loop: connected in setFly(true), disconnected in setFly(false)
-flyStep = function(dt)
+local function flyStepBody(dt)
     if not flying then
         return
     end
@@ -1626,6 +1656,19 @@ flyStep = function(dt)
             simTimer = 0
             pcall(setHidden, LP, "SimulationRadius", mathHuge)
             pcall(setHidden, LP, "MaximumSimulationRadius", mathHuge)
+        end
+    end
+
+    -- Re-acquire the character parts instead of switching fly off on a hiccup
+    local char = LP.Character
+
+    if char then
+        if not root or not root.Parent then
+            root = char:FindFirstChild("HumanoidRootPart")
+        end
+
+        if not humanoid or not humanoid.Parent then
+            humanoid = char:FindFirstChildOfClass("Humanoid")
         end
     end
 
@@ -1744,6 +1787,21 @@ flyStep = function(dt)
         end
     end
 
+    -- Keep the constraints consistent with the hold state
+    if not holding then
+        if not velocity.Enabled then
+            velocity.Enabled = true
+        end
+
+        if alignPos.Enabled then
+            alignPos.Enabled = false
+        end
+    end
+
+    if not orientation.Enabled then
+        orientation.Enabled = true
+    end
+
     -- Keep assembly upright, only yaw is allowed
     if orientation then
         local yaw = getFlatYaw(cf)
@@ -1764,6 +1822,23 @@ flyStep = function(dt)
     if stabTimer >= STAB_INTERVAL then
         stabilizeAssembly(assembly, seated, stabTimer)
         stabTimer = 0
+    end
+end
+
+-- A runtime error inside the fly step would silently stop the fly: show it instead
+local lastFlyError = nil
+
+flyStep = function(dt)
+    local ok, err = pcall(flyStepBody, dt)
+
+    if not ok then
+        local msg = tostring(err)
+
+        if msg ~= lastFlyError then
+            lastFlyError = msg
+            warn("[FlySeat] fly error: " .. msg)
+            notify("FLY ERROR: " .. msg:sub(1, 60))
+        end
     end
 end
 
