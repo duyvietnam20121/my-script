@@ -89,7 +89,7 @@ local CONFIG = {
     SEAT = {
         KEEP_SEATED = true,  -- if the humanoid leaves the picked seat by itself, sit back down (exit only with E / button)
         SUSPEND_PICKER = true,  -- pause the Seat Picker while seated; it comes back on exit
-        ROTATE_WITH_CAMERA = false,  -- seated: false keeps the part's heading fixed so riders aren't spun around
+        ROTATE_WITH_CAMERA = true,  -- seated: false keeps the part's heading fixed so riders aren't spun around
     },
 
     -- Hold the part in place when idle (pulls it back after being pushed)
