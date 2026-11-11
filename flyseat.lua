@@ -1,4 +1,5 @@
 -- FlySeat: fly + seat picker
+-- Executor script (Luau). PC + mobile.
 
 --==================================================
 -- SERVICES
@@ -89,7 +90,7 @@ local CONFIG = {
     SEAT = {
         KEEP_SEATED = true,  -- if the humanoid leaves the picked seat by itself, sit back down (exit only with E / button)
         SUSPEND_PICKER = true,  -- pause the Seat Picker while seated; it comes back on exit
-        ROTATE_WITH_CAMERA = true,  -- seated: false keeps the part's heading fixed so riders aren't spun around
+        ROTATE_WITH_CAMERA = false,  -- seated: false keeps the part's heading fixed so riders aren't spun around
     },
 
     -- Hold the part in place when idle (pulls it back after being pushed)
@@ -123,11 +124,13 @@ local CONFIG = {
         },
     },
 
-    -- Make nearby players pass through the picked part locally so they can't push it (runs while a part is picked)
-    PUSH = {
+    -- Massless on the picked assembly and the loose parts around you while seated.
+    -- Written with sethiddenproperty (falls back to a normal write); original values are restored on exit.
+    -- Radius / player filter come from LIGHTEN.NEARBY.
+    MASSLESS = {
         ENABLED = true,
-        RADIUS = 60,           -- studs around you
-        REFRESH = 0.25,        -- seconds between nearby-player refreshes
+        INTERVAL = 1,          -- seconds between passes
+        PER_PASS = 200,        -- parts changed per pass (hitch guard)
     },
 
     -- Seconds between updates
@@ -239,8 +242,7 @@ local seatPickerEnabled = false
 local currentSeat = nil
 local pendingSeat = nil
 local charWeldInst = nil
-local pickedPart = nil  -- the part we picked (anti-push pairs collisions against it)
-local startPushGuard, stopPushGuard  -- anti-push, defined further below
+local pickedPart = nil  -- the part we picked (its assembly is made massless)
 
 -- Seat Picker is paused while seated (functions are defined after setSeatPicker)
 local pickerSuspended = false
@@ -715,6 +717,19 @@ local function restoreLightened()
     stopAntiGravity()
 end
 
+-- A loose part we may touch: unanchored, not part of your own character,
+-- and (unless includePlayers) not part of another character either.
+local function isTargetPart(p, char, includePlayers)
+    if p.Anchored or (char and p:IsDescendantOf(char)) then
+        return false
+    end
+
+    local model = p.Parent
+    local isCharacter = model and model:FindFirstChildOfClass("Humanoid")
+
+    return not isCharacter or includePlayers
+end
+
 -- Lightens one loose part. Returns true if it changed.
 -- UNIFORM: every part gets MIN_DENSITY, so nearby parts all weigh alike
 -- (riders and the part they stand on keep a sane mass ratio).
@@ -763,16 +778,13 @@ local function lightenPart(part)
     end
 
     local list = { part }
+    local char = getCharacter()
     local ok, connected = pcall(part.GetConnectedParts, part, true)
 
     if ok then
         for _, p in ipairs(connected) do
-            if p ~= part and #list < cfg.MAX_PARTS then
-                local model = p.Parent
-
-                if not (model and model:FindFirstChildOfClass("Humanoid")) then
-                    list[#list + 1] = p
-                end
+            if p ~= part and #list < cfg.MAX_PARTS and isTargetPart(p, char, false) then
+                list[#list + 1] = p
             end
         end
     end
@@ -817,21 +829,144 @@ local function lightenNearby()
     for i = 1, #parts do
         local p = parts[i]
 
-        if not lightenSeen[p] and not p.Anchored then
-            local model = p.Parent
-            local isCharacter = model and model:FindFirstChildOfClass("Humanoid")
+        if not lightenSeen[p] and isTargetPart(p, char, nearby.INCLUDE_PLAYERS) then
+            if lightenOne(p, cfg) then
+                changed += 1
 
-            if not isCharacter or (nearby.INCLUDE_PLAYERS and model ~= char) then
-                if lightenOne(p, cfg) then
-                    changed += 1
-
-                    if changed >= nearby.PER_PASS then
-                        break
-                    end
+                if changed >= nearby.PER_PASS then
+                    break
                 end
             end
         end
     end
+end
+
+-- Massless pass (every CONFIG.MASSLESS.INTERVAL seconds while a part is picked)
+-- Pseudocode:
+--   parts = picked part + its welded parts + loose parts within NEARBY.RADIUS
+--   for each part not handled yet: remember original Massless, set Massless = true
+--   on exit: put every remembered value back
+local masslessOriginal = {}  -- part -> original Massless
+
+local function writeMassless(p, value)
+    local done = false
+
+    if setHidden then
+        done = pcall(setHidden, p, "Massless", value)
+    end
+
+    -- Verify, then fall back to a normal write
+    local ok, current = pcall(function()
+        return p.Massless
+    end)
+
+    if not done or not ok or current ~= value then
+        pcall(function()
+            p.Massless = value
+        end)
+    end
+end
+
+-- Returns true if the part was actually changed
+local function masslessOne(p)
+    if masslessOriginal[p] ~= nil then
+        return false
+    end
+
+    local ok, original = pcall(function()
+        return p.Massless
+    end)
+
+    if not ok then
+        return false
+    end
+
+    masslessOriginal[p] = original
+
+    if original then
+        return false
+    end
+
+    writeMassless(p, true)
+
+    return true
+end
+
+local function masslessPass()
+    local cfg = CONFIG.MASSLESS
+    local nearby = CONFIG.LIGHTEN.NEARBY
+    local char = LP.Character
+    local changed = 0
+
+    -- The picked assembly
+    if pickedPart and pickedPart.Parent then
+        if masslessOne(pickedPart) then
+            changed += 1
+        end
+
+        local ok, connected = pcall(pickedPart.GetConnectedParts, pickedPart, true)
+
+        if ok then
+            for _, p in ipairs(connected) do
+                if changed >= cfg.PER_PASS then
+                    break
+                end
+
+                if p ~= pickedPart
+                    and masslessOriginal[p] == nil
+                    and isTargetPart(p, char, false)
+                    and masslessOne(p) then
+
+                    changed += 1
+                end
+            end
+        end
+    end
+
+    -- Loose parts around you
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+
+    if not hrp then
+        return
+    end
+
+    local ok, parts = pcall(
+        Workspace.GetPartBoundsInRadius,
+        Workspace,
+        hrp.Position,
+        nearby.RADIUS,
+        nearbyParams
+    )
+
+    if not ok then
+        return
+    end
+
+    for i = 1, #parts do
+        if changed >= cfg.PER_PASS then
+            break
+        end
+
+        local p = parts[i]
+
+        if masslessOriginal[p] == nil
+            and isTargetPart(p, char, nearby.INCLUDE_PLAYERS)
+            and masslessOne(p) then
+
+            changed += 1
+        end
+    end
+end
+
+local function restoreMassless()
+    for p, original in pairs(masslessOriginal) do
+        -- Only parts we switched on (original == false) need switching back
+        if original == false and p.Parent then
+            writeMassless(p, false)
+        end
+    end
+
+    table.clear(masslessOriginal)
 end
 
 local function cleanupSeat(resetHumanoid)
@@ -869,12 +1004,9 @@ local function cleanupSeat(resetHumanoid)
     end
 
     restoreLightened()
+    restoreMassless()
 
     pickedPart = nil
-
-    if stopPushGuard then
-        stopPushGuard()
-    end
 
     if charWeldInst then
         pcall(charWeldInst.Destroy, charWeldInst)
@@ -1121,7 +1253,6 @@ local function sitOnPart(part)
 
         pickedPart = part
         lightenPart(part)
-        startPushGuard()
 
         print("[FlySeat] Sit successful (Seat:Sit)")
         return
@@ -1217,7 +1348,6 @@ local function sitOnPart(part)
 
     pickedPart = part
     lightenPart(part)
-    startPushGuard()
 
     print("[FlySeat] Sit successful (Weld)")
 end
@@ -1465,6 +1595,7 @@ end
 local statusTimer = 0
 local highlightTimer = 0
 local nearbyTimer = 0
+local masslessTimer = 0
 local simTimer = 0
 local comTimer = 0
 local stabTimer = 0
@@ -1639,6 +1770,18 @@ connect(RunService.Heartbeat, function(dt)
         end
     else
         nearbyTimer = CONFIG.LIGHTEN.NEARBY.INTERVAL
+    end
+
+    -- Massless on the picked assembly and nearby parts while a part is picked
+    if currentSeat and CONFIG.MASSLESS.ENABLED then
+        masslessTimer += dt
+
+        if masslessTimer >= CONFIG.MASSLESS.INTERVAL then
+            masslessTimer = 0
+            masslessPass()
+        end
+    else
+        masslessTimer = CONFIG.MASSLESS.INTERVAL
     end
 end)
 
@@ -2051,169 +2194,18 @@ connect(LP.CharacterAdded, function()
 end)
 
 --==================================================
--- ANTI-PUSH (runs while a part is picked)
---==================================================
--- Two layers, both local to this client's simulation:
---  1. NoCollisionConstraint between nearby players' main parts and the picked
---     part. Humanoids never touch these, so they hold.
---  2. CanCollide = false on those parts every Stepped and Heartbeat, because
---     Humanoids re-enable collision on their torso / head / root.
-
-local PUSH_RADIUS = CONFIG.PUSH.RADIUS
-local PUSH_REFRESH = CONFIG.PUSH.REFRESH
-
-local PUSH_KEY_PARTS = {
-    HumanoidRootPart = true,
-    Head = true,
-    Torso = true,
-    UpperTorso = true,
-    LowerTorso = true,
-}
-
-local pushTargets = {}
-local pushChanged = setmetatable({}, { __mode = "k" })  -- parts we turned non-collidable
-local pushPairs = {}   -- their part -> NoCollisionConstraint
-local pushTimer = 0
-local pushConns = {}
-
-local function refreshPushTargets()
-    table.clear(pushTargets)
-
-    -- Drop constraints whose parts are gone
-    for part, constraint in pairs(pushPairs) do
-        if not part.Parent or not constraint.Parent then
-            pcall(constraint.Destroy, constraint)
-            pushPairs[part] = nil
-        end
-    end
-
-    local char = LP.Character
-    local myRoot = char and char:FindFirstChild("HumanoidRootPart")
-
-    if not myRoot then
-        return
-    end
-
-    local origin = myRoot.Position
-    local created = 0
-
-    for _, plr in ipairs(Players:GetPlayers()) do
-        local c = plr ~= LP and plr.Character
-        local r = c and c:FindFirstChild("HumanoidRootPart")
-
-        if r and (r.Position - origin).Magnitude <= PUSH_RADIUS then
-            for _, obj in ipairs(c:GetChildren()) do
-                if obj:IsA("BasePart") and (obj.CanCollide or PUSH_KEY_PARTS[obj.Name]) then
-                    pushTargets[#pushTargets + 1] = obj
-
-                    -- Layer 1: a constraint against the picked part
-                    if pickedPart and pickedPart.Parent
-                        and PUSH_KEY_PARTS[obj.Name]
-                        and not pushPairs[obj]
-                        and created < 20 then
-
-                        local ok, constraint = pcall(function()
-                            local nc = Instance.new("NoCollisionConstraint")
-
-                            nc.Name = randomName()
-                            nc.Part0 = obj
-                            nc.Part1 = pickedPart
-                            nc.Parent = pickedPart
-
-                            return nc
-                        end)
-
-                        if ok then
-                            pushPairs[obj] = constraint
-                            created += 1
-                        end
-                    end
-                end
-            end
-        end
-    end
-end
-
-local function restorePush()
-    for _, constraint in pairs(pushPairs) do
-        pcall(constraint.Destroy, constraint)
-    end
-
-    for part in pairs(pushChanged) do
-        pcall(function()
-            part.CanCollide = true
-        end)
-    end
-
-    table.clear(pushPairs)
-    table.clear(pushChanged)
-    table.clear(pushTargets)
-end
-
--- Layer 2, applied twice per frame (Stepped and Heartbeat)
-local function pushApply()
-    for i = 1, #pushTargets do
-        local part = pushTargets[i]
-
-        if part.CanCollide then
-            part.CanCollide = false
-            pushChanged[part] = true
-        end
-    end
-end
-
-local function pushStep(_, dt)
-    if not currentSeat then
-        if next(pushChanged) or next(pushPairs) then
-            restorePush()
-        end
-
-        return
-    end
-
-    pushTimer += dt
-
-    if pushTimer >= PUSH_REFRESH then
-        pushTimer = 0
-        refreshPushTargets()
-    end
-
-    pushApply()
-end
-
-function startPushGuard()
-    if not CONFIG.PUSH.ENABLED or pushConns[1] then
-        return
-    end
-
-    pushTimer = PUSH_REFRESH
-
-    pushConns[1] = RunService.Stepped:Connect(pushStep)
-    pushConns[2] = RunService.Heartbeat:Connect(pushApply)
-end
-
-function stopPushGuard()
-    for i = 1, #pushConns do
-        pushConns[i]:Disconnect()
-    end
-
-    table.clear(pushConns)
-
-    restorePush()
-end
-
---==================================================
 -- GLOBAL CLEANUP
 --==================================================
 
 local function fullCleanup()
+    -- Cancel any in-flight sitOnPart so it can't rebuild a seat after cleanup
+    sitToken += 1
+
     setFly(false)
 
     setSeatPicker(false)
 
     cleanupSeat(true)
-
-    stopPushGuard()
 
     if highlight then
         pcall(highlight.Destroy, highlight)
