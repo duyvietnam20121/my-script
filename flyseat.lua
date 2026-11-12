@@ -167,11 +167,19 @@ local CONFIG = {
         UNIFORM = false,
         ANTI_GRAVITY = true,
 
+        -- Other players near you (PUSH.RADIUS) are re-enforced every PUSH.REFRESH
+        -- seconds: MIN_DENSITY + Massless, so they can't shove your picked part.
+        PLAYERS = {
+            ENABLED = true,
+            MASSLESS = true,  -- limbs / head stop adding mass (the root part keeps its tiny mass)
+        },
+
         -- Every unanchored part in the whole Workspace gets MIN_DENSITY
         -- (processed in batches so big maps don't freeze; new parts are caught too)
         GLOBAL = {
             ENABLED = true,
-            PER_FRAME = 150,         -- parts handled per frame
+            BUDGET = 0.003,          -- seconds of work per frame (bigger = faster, but can drop FPS)
+            RESCAN = 2,              -- seconds between re-checks (catches parts that were unanchored later)
             INCLUDE_PLAYERS = true,  -- other players' parts too (your own character is never touched)
         },
 
@@ -675,6 +683,7 @@ end
 -- part -> original CustomPhysicalProperties (false = default)
 local lightened = {}
 local lightenSeen = setmetatable({}, { __mode = "k" })
+local massless = {}  -- other players' parts we set Massless: part -> original value
 
 local antiGen = 0
 local antiObjects = {}
@@ -722,8 +731,10 @@ local function startAntiGravity(part)
     end)
 end
 
--- Workspace-wide lightening job (queue of parts, drained a few per frame)
-local GL = { gen = 0, conn = nil, queue = {}, head = 1 }
+-- Workspace-wide lightening job.
+--   fresh = parts that just appeared (always handled first)
+--   bulk  = initial / periodic scan (drained within a per-frame time budget)
+local GL = { gen = 0, conn = nil, extra = {}, fresh = {}, freshHead = 1, bulk = {}, bulkHead = 1 }
 
 local function stopGlobalLighten()
     GL.gen += 1
@@ -733,8 +744,15 @@ local function stopGlobalLighten()
         GL.conn = nil
     end
 
-    table.clear(GL.queue)
-    GL.head = 1
+    for _, c in ipairs(GL.extra) do
+        c:Disconnect()
+    end
+
+    table.clear(GL.extra)
+    table.clear(GL.fresh)
+    table.clear(GL.bulk)
+    GL.freshHead = 1
+    GL.bulkHead = 1
 end
 
 local function restoreLightened()
@@ -746,6 +764,13 @@ local function restoreLightened()
         end)
     end
 
+    for part, original in pairs(massless) do
+        pcall(function()
+            part.Massless = original
+        end)
+    end
+
+    table.clear(massless)
     table.clear(lightened)
     table.clear(lightenSeen)
 
@@ -788,8 +813,51 @@ local function lightenOne(p, cfg)
     return true
 end
 
+--- Keeps one part of ANOTHER player light. Unlike lightenOne it is meant to be
+--- called repeatedly (humanoids can reset physics), so it re-checks every time.
+--- Everything it changes is undone by restoreLightened().
+local function lightenPlayerPart(p)
+    local cfg = CONFIG.LIGHTEN
+
+    if p.Anchored then
+        return
+    end
+
+    local ok, cur = pcall(function()
+        return p.CurrentPhysicalProperties
+    end)
+
+    if ok and cur.Density > cfg.MIN_DENSITY + 0.0001 then
+        if lightened[p] == nil then
+            lightened[p] = p.CustomPhysicalProperties or false
+        end
+
+        pcall(function()
+            p.CustomPhysicalProperties = PhysicalProperties.new(
+                cfg.MIN_DENSITY,
+                cur.Friction,
+                cur.Elasticity,
+                cur.FrictionWeight,
+                cur.ElasticityWeight
+            )
+        end)
+    end
+
+    -- The root part is the assembly root: Massless has no effect on it
+    if cfg.PLAYERS.MASSLESS and p.Name ~= "HumanoidRootPart" and not p.Massless then
+        massless[p] = false
+
+        pcall(function()
+            p.Massless = true
+        end)
+    end
+end
+
 --- Lightens EVERY unanchored part in Workspace to MIN_DENSITY (0.01).
---- Existing parts are queued once; parts added later are queued as they appear.
+--- * New parts jump the queue (DescendantAdded -> `fresh`).
+--- * A periodic scan (RESCAN) catches parts that were anchored when they
+---   appeared and got unanchored later (dropped items, broken welds, ...).
+--- * Work is limited by a time budget per frame, so big maps don't freeze.
 --- Runs until the seat is released (restoreLightened -> stopGlobalLighten).
 local function startGlobalLighten()
     local g = CONFIG.LIGHTEN.GLOBAL
@@ -803,43 +871,113 @@ local function startGlobalLighten()
     local gen = GL.gen
     local cfg = { MIN_DENSITY = CONFIG.LIGHTEN.MIN_DENSITY, UNIFORM = true }
 
-    local function enqueue(inst)
-        if inst:IsA("BasePart") then
-            GL.queue[#GL.queue + 1] = inst
+    local function handle(p, char)
+        if not p.Parent or p.Anchored then
+            return
+        end
+
+        local isCharacter = p.Parent:FindFirstChildOfClass("Humanoid") ~= nil
+        local isMine = char and p:IsDescendantOf(char)
+
+        if not isMine and (not isCharacter or g.INCLUDE_PLAYERS) then
+            lightenOne(p, cfg)
         end
     end
 
-    for _, inst in ipairs(Workspace:GetDescendants()) do
-        enqueue(inst)
+    --- Queues every unanchored, not-yet-lightened part
+    local function scan()
+        for _, inst in ipairs(Workspace:GetDescendants()) do
+            if inst:IsA("BasePart") and not inst.Anchored and not lightenSeen[inst] then
+                GL.bulk[#GL.bulk + 1] = inst
+            end
+        end
     end
 
-    GL.conn = Workspace.DescendantAdded:Connect(enqueue)
+    GL.conn = Workspace.DescendantAdded:Connect(function(inst)
+        if inst:IsA("BasePart") then
+            GL.fresh[#GL.fresh + 1] = inst
+        end
+    end)
 
-    task.spawn(function()
-        while gen == GL.gen do
-            local char = LP.Character
-            local handled = 0
+    -- Other players (already here, newly joined, or respawning): their character
+    -- is queued several times while it loads, because characters often spawn
+    -- anchored / without all parts yet and would otherwise be skipped.
+    local RECHECK_DELAYS = { 0, 0.5, 1, 2.5 }
 
-            while GL.head <= #GL.queue and handled < g.PER_FRAME do
-                local p = GL.queue[GL.head]
-                GL.head += 1
-                handled += 1
+    local function queueCharacter(char)
+        task.spawn(function()
+            for _, delay in ipairs(RECHECK_DELAYS) do
+                if delay > 0 then
+                    taskWait(delay)
+                end
 
-                if p.Parent and not p.Anchored then
-                    local model = p.Parent
-                    local isCharacter = model:FindFirstChildOfClass("Humanoid") ~= nil
-                    local isMine = char and p:IsDescendantOf(char)
+                if gen ~= GL.gen or not char.Parent then
+                    return
+                end
 
-                    if not isMine and (not isCharacter or g.INCLUDE_PLAYERS) then
-                        lightenOne(p, cfg)
+                for _, d in ipairs(char:GetDescendants()) do
+                    if d:IsA("BasePart") and not lightenSeen[d] then
+                        GL.fresh[#GL.fresh + 1] = d
                     end
                 end
             end
+        end)
+    end
 
-            -- Queue drained: reset it so it doesn't grow forever
-            if GL.head > #GL.queue then
-                table.clear(GL.queue)
-                GL.head = 1
+    local function watchPlayer(plr)
+        if plr == LP then
+            return
+        end
+
+        GL.extra[#GL.extra + 1] = plr.CharacterAdded:Connect(queueCharacter)
+
+        if plr.Character then
+            queueCharacter(plr.Character)
+        end
+    end
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        watchPlayer(plr)
+    end
+
+    GL.extra[#GL.extra + 1] = Players.PlayerAdded:Connect(watchPlayer)
+
+    task.spawn(function()
+        local nextScan = 0
+
+        while gen == GL.gen do
+            local now = os.clock()
+
+            -- Start a new scan only when the previous one is fully drained
+            if now >= nextScan and GL.bulkHead > #GL.bulk then
+                nextScan = now + g.RESCAN
+                scan()
+            end
+
+            local deadline = os.clock() + g.BUDGET
+            local char = LP.Character
+
+            while GL.freshHead <= #GL.fresh and os.clock() < deadline do
+                local p = GL.fresh[GL.freshHead]
+                GL.freshHead += 1
+                handle(p, char)
+            end
+
+            while GL.bulkHead <= #GL.bulk and os.clock() < deadline do
+                local p = GL.bulk[GL.bulkHead]
+                GL.bulkHead += 1
+                handle(p, char)
+            end
+
+            -- Drained: reset so the arrays don't grow forever
+            if GL.freshHead > #GL.fresh then
+                table.clear(GL.fresh)
+                GL.freshHead = 1
+            end
+
+            if GL.bulkHead > #GL.bulk then
+                table.clear(GL.bulk)
+                GL.bulkHead = 1
             end
 
             taskWait()
@@ -2079,6 +2217,10 @@ do
 
             if r and (r.Position - origin).Magnitude <= PUSH_RADIUS then
                 for _, obj in ipairs(c:GetChildren()) do
+                    if CONFIG.LIGHTEN.ENABLED and CONFIG.LIGHTEN.PLAYERS.ENABLED and obj:IsA("BasePart") then
+                        lightenPlayerPart(obj)
+                    end
+
                     if obj:IsA("BasePart") and (obj.CanCollide or PUSH_KEY_PARTS[obj.Name]) then
                         pushTargets[#pushTargets + 1] = obj
 
