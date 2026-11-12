@@ -1,4 +1,25 @@
--- FlySeat: fly + seat picker
+--[[
+    FlySeat v2: fly + seat picker (Roblox executor script)
+
+    Controls (PC):
+        F            toggle fly
+        G            toggle Seat Picker (click an unanchored part to sit on it)
+        E            exit the picked seat
+        = / -        speed up / down
+        RightShift   show / hide the panel
+        W A S D / Space / Ctrl   move / up / down
+
+    Changes vs v1:
+        * Movement input is polled with UIS:IsKeyDown -> no more "stuck keys"
+          (e.g. releasing LeftCtrl while RightCtrl is held)
+        * Panel is dragged by its title bar only (buttons no longer start a drag)
+        * Hotkeys for speed and panel visibility
+        * Leaving a seat while flying puts the humanoid back into Physics state
+        * sitOnPart split into small helpers (no duplicated "picked" block)
+        * `new()` helper removes ~200 lines of Instance boilerplate
+        * Drag connection no longer leaks on cleanup
+        * Cleanup also runs on CharacterRemoving (not only CharacterAdded)
+]]
 
 --==================================================
 -- SERVICES
@@ -19,28 +40,12 @@ local CAS = getService("ContextActionService")
 local Workspace = getService("Workspace")
 local CoreGui = getService("CoreGui")
 
--- Cached globals for hot paths (local access is faster than global lookup)
+-- Cached globals for hot paths
 local mathExp, mathClamp, mathAbs = math.exp, math.clamp, math.abs
 local mathMin, mathMax, mathAtan2 = math.min, math.max, math.atan2
 local mathHuge = math.huge
 local taskWait, taskDelay = task.wait, task.delay
 local CFAngles = CFrame.Angles
-
--- Random instance names (new name for every instance)
-local rng = Random.new()
-local NAME_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-
-local function randomName()
-    local len = rng:NextInteger(8, 14)
-    local out = table.create(len)
-
-    for i = 1, len do
-        local n = rng:NextInteger(1, #NAME_CHARS)
-        out[i] = NAME_CHARS:sub(n, n)
-    end
-
-    return table.concat(out)
-end
 
 local LP = Players.LocalPlayer
 local Mouse = LP:GetMouse()
@@ -55,15 +60,65 @@ local VEC_ZERO = Vector3.zero
 local VEC_Y = Vector3.yAxis
 
 --==================================================
--- CONFIG (keys, speed, update frequencies)
+-- UTILITIES
+--==================================================
+
+local rng = Random.new()
+local NAME_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+--- Random 8-14 character name (a new one for every instance).
+local function randomName()
+    local len = rng:NextInteger(8, 14)
+    local out = table.create(len)
+
+    for i = 1, len do
+        local n = rng:NextInteger(1, #NAME_CHARS)
+        out[i] = NAME_CHARS:sub(n, n)
+    end
+
+    return table.concat(out)
+end
+
+--- Creates an instance with a random name. Properties are applied BEFORE
+--- parenting (cheaper, and avoids flashes such as an Adornee-less Highlight).
+--- @param className string
+--- @param props table? property -> value
+--- @param parent Instance?
+local function new(className, props, parent)
+    local inst = Instance.new(className)
+    inst.Name = randomName()
+
+    if props then
+        for k, v in pairs(props) do
+            inst[k] = v
+        end
+    end
+
+    inst.Parent = parent
+
+    return inst
+end
+
+--- Destroys an instance, ignoring nil / already destroyed.
+local function destroy(inst)
+    if inst then
+        pcall(inst.Destroy, inst)
+    end
+end
+
+--==================================================
+-- CONFIG
 --==================================================
 
 local CONFIG = {
     -- PC hotkeys
     KEYS = {
-        FLY = KC.F,          -- toggle fly
-        SEAT_PICKER = KC.G,  -- toggle Seat Picker
-        EXIT_SEAT = KC.E,    -- leave the picked seat
+        FLY = KC.F,
+        SEAT_PICKER = KC.G,
+        EXIT_SEAT = KC.E,
+        SPEED_UP = KC.Equals,
+        SPEED_DOWN = KC.Minus,
+        TOGGLE_GUI = KC.RightShift,
     },
 
     -- Movement keys (action -> key codes)
@@ -82,73 +137,81 @@ local CONFIG = {
         MIN = 10,
         MAX = 250,
         STEP = 10,
-        SEATED_CAP = 80,  -- max speed while seated on a part (raise toward MAX for stronger control)
-        SMOOTHING = 8,    -- acceleration easing (1/s); higher = snappier, 0 = instant. Smoother = less riders jitter
+        SEATED_CAP = 80,  -- max speed while seated on a part
+        SMOOTHING = 8,    -- acceleration easing (1/s); 0 = instant
     },
 
     SEAT = {
-        KEEP_SEATED = true,  -- if the humanoid leaves the picked seat by itself, sit back down (exit only with E / button)
-        SUSPEND_PICKER = true,  -- pause the Seat Picker while seated; it comes back on exit
-        ROTATE_WITH_CAMERA = true,  -- seated: false keeps the part's heading fixed so riders aren't spun around
+        KEEP_SEATED = true,        -- sit back down if the humanoid leaves by itself
+        SUSPEND_PICKER = true,     -- pause the Seat Picker while seated
+        ROTATE_WITH_CAMERA = true, -- false keeps the heading fixed while seated
+        FREEZE_PART = false,       -- keep the seat anchored instead of welding it to the part
     },
 
-    -- Hold the part in place when idle (pulls it back after being pushed)
+    -- Hold the part in place when idle
     HOLD = {
         ENABLED = true,
-        DELAY = 0.15,          -- seconds without input before holding
+        DELAY = 0.15,
         RESPONSIVENESS = 100,
-        MAX_SPEED = 200,       -- studs/second used to snap back
-        RIGID = true,          -- hold like a hard weld to the world (ignores RESPONSIVENESS / MAX_SPEED)
-        SNAP_DISTANCE = 8,     -- studs: if the held part is pulled farther than this it is put back (0 = off)
+        MAX_SPEED = 200,
+        RIGID = true,
+        SNAP_DISTANCE = 8,  -- studs (0 = off)
     },
 
-    -- Make the picked part (and its welded parts) feather-light while seated.
-    -- Heavy parts are what makes them sag / fall; density is restored on exit.
+    -- Feather-light picked part (density restored on exit)
     LIGHTEN = {
         ENABLED = true,
-        TARGET_MASS = 25,      -- heavy parts are brought down to about this mass (never lighter than needed)
-        MIN_DENSITY = 0.01,    -- lowest density Roblox allows
-        MAX_PARTS = 40,        -- connected parts handled per pick
-        UNIFORM = false,        -- every lightened part gets MIN_DENSITY (false = only bring heavy parts down to TARGET_MASS)
-        ANTI_GRAVITY = true,   -- the picked assembly gets an upward force equal to its weight (weightless)
+        TARGET_MASS = 25,
+        MIN_DENSITY = 0.01,
+        MAX_PARTS = 40,
+        UNIFORM = false,
+        ANTI_GRAVITY = true,
 
-        -- Also lighten every loose part around you while seated
+        -- Every unanchored part in the whole Workspace gets MIN_DENSITY
+        -- (processed in batches so big maps don't freeze; new parts are caught too)
+        GLOBAL = {
+            ENABLED = true,
+            PER_FRAME = 150,         -- parts handled per frame
+            INCLUDE_PLAYERS = true,  -- other players' parts too (your own character is never touched)
+        },
+
         NEARBY = {
             ENABLED = true,
-            RADIUS = 40,       -- studs around you
-            INTERVAL = 1,      -- seconds between passes
-            PER_PASS = 25,     -- parts lightened per pass
-            QUERY_MAX = 1000,  -- hard cap on parts returned per query
-            INCLUDE_PLAYERS = true,  -- also other players' parts (local only; your own character is never touched)
+            RADIUS = 40,
+            INTERVAL = 1,
+            PER_PASS = 25,
+            QUERY_MAX = 1000,
+            INCLUDE_PLAYERS = true,
         },
     },
 
-    -- Make nearby players pass through the picked part locally so they can't push it (runs while a part is picked)
+    -- Nearby players pass through the picked part (local only)
     PUSH = {
         ENABLED = true,
-        RADIUS = 60,           -- studs around you
-        REFRESH = 0.25,        -- seconds between nearby-player refreshes
+        RADIUS = 60,
+        REFRESH = 0.25,
     },
 
     -- Seconds between updates
     INTERVALS = {
-        STATUS = 0.2,          -- status text
-        HIGHLIGHT = 0.05,      -- Seat Picker highlight
-        SIM_RADIUS = 0.1,      -- SimulationRadius write (while flying)
-        CENTER_OF_MASS = 0.2,  -- assembly center-of-mass re-read (while flying)
-        CENTER_OF_MASS_SEATED = 0.02,  -- same, but while seated (riders move the center of mass)
-        STABILIZE = 1 / 30,    -- anti tilt / anti spin (while flying)
+        STATUS = 0.2,
+        HIGHLIGHT = 0.05,
+        SIM_RADIUS = 0.1,
+        CENTER_OF_MASS = 0.2,
+        CENTER_OF_MASS_SEATED = 0.02,
+        STABILIZE = 1 / 30,
     },
 }
 
--- Button labels (key hints come from CONFIG.KEYS)
+local K = CONFIG.KEYS
+
 local LABELS = {
-    FLY_ON = ("FLY [%s]: ON"):format(CONFIG.KEYS.FLY.Name),
-    FLY_OFF = ("FLY [%s]: OFF"):format(CONFIG.KEYS.FLY.Name),
-    SEAT_ON = ("SEAT PICKER [%s]: ON"):format(CONFIG.KEYS.SEAT_PICKER.Name),
-    SEAT_OFF = ("SEAT PICKER [%s]: OFF"):format(CONFIG.KEYS.SEAT_PICKER.Name),
-    SEAT_PAUSED = ("SEAT PICKER [%s]: PAUSED"):format(CONFIG.KEYS.SEAT_PICKER.Name),
-    EXIT = ("EXIT SEAT [%s]"):format(CONFIG.KEYS.EXIT_SEAT.Name),
+    FLY_ON = ("FLY [%s]: ON"):format(K.FLY.Name),
+    FLY_OFF = ("FLY [%s]: OFF"):format(K.FLY.Name),
+    SEAT_ON = ("SEAT PICKER [%s]: ON"):format(K.SEAT_PICKER.Name),
+    SEAT_OFF = ("SEAT PICKER [%s]: OFF"):format(K.SEAT_PICKER.Name),
+    SEAT_PAUSED = ("SEAT PICKER [%s]: PAUSED"):format(K.SEAT_PICKER.Name),
+    EXIT = ("EXIT SEAT [%s]"):format(K.EXIT_SEAT.Name),
 }
 
 --==================================================
@@ -178,10 +241,9 @@ do
         SeatPickerCharWeld = true,
     }
 
-    -- Seats / highlight are direct Workspace children; welds live in the character
     for _, obj in ipairs(Workspace:GetChildren()) do
         if STALE[obj.Name] then
-            pcall(obj.Destroy, obj)
+            destroy(obj)
         end
     end
 
@@ -190,44 +252,38 @@ do
     if char then
         for _, obj in ipairs(char:GetDescendants()) do
             if STALE[obj.Name] then
-                pcall(obj.Destroy, obj)
+                destroy(obj)
             end
         end
     end
 end
 
 --==================================================
--- SETTINGS
+-- SETTINGS (mutable at runtime)
 --==================================================
 
-local FREEZE_PART = false
 local KEEP_SEATED = CONFIG.SEAT.KEEP_SEATED
 local SUSPEND_PICKER = CONFIG.SEAT.SUSPEND_PICKER
 local ROTATE_SEATED = CONFIG.SEAT.ROTATE_WITH_CAMERA
+local FREEZE_PART = CONFIG.SEAT.FREEZE_PART
 
--- Fly
-local speed = CONFIG.SPEED.DEFAULT
-local minSpeed = CONFIG.SPEED.MIN
-local maxSpeed = CONFIG.SPEED.MAX
-local speedStep = CONFIG.SPEED.STEP
-
--- Seated speed
+local speed = mathClamp(CONFIG.SPEED.DEFAULT, CONFIG.SPEED.MIN, CONFIG.SPEED.MAX)
 local SEATED_SPEED_CAP = CONFIG.SPEED.SEATED_CAP
 
--- Upright
+-- Upright / anti spin
 local UPRIGHT_RESPONSIVENESS = 100
 local UPRIGHT_MAX_TORQUE = mathHuge
 local UPRIGHT_MAX_ANGULAR = 120
-
--- Anti spin
 local NORMAL_DAMPING = 10
 local SEATED_DAMPING = 15
-
 local MAX_YAW_RATE = 8
 
 -- GUI colors
 local COLOR_ON = Color3.fromRGB(35, 160, 85)
 local COLOR_OFF = Color3.fromRGB(38, 38, 48)
+local WHITE = Color3.new(1, 1, 1)
+local GREY = Color3.fromRGB(180, 180, 190)
+local GREEN = Color3.fromRGB(0, 255, 0)
 
 --==================================================
 -- STATE
@@ -239,12 +295,11 @@ local seatPickerEnabled = false
 local currentSeat = nil
 local pendingSeat = nil
 local charWeldInst = nil
-local pickedPart = nil  -- the part we picked (anti-push pairs collisions against it)
-local startPushGuard, stopPushGuard  -- anti-push, defined further below
+local pickedPart = nil
+local startPushGuard, stopPushGuard  -- defined in the anti-push section
 
--- Seat Picker is paused while seated (functions are defined after setSeatPicker)
 local pickerSuspended = false
-local suspendPicker, resumePicker
+local suspendPicker, resumePicker  -- defined after setSeatPicker
 
 local highlight = nil
 
@@ -254,13 +309,13 @@ local humanoid = nil
 local attachment = nil
 local velocity = nil
 local orientation = nil
-local alignPos = nil   -- holds position while idle
+local alignPos = nil
 local holding = false
 local idleTimer = 0
 
 local oldAutoRotate = nil
 local lastYaw = 0
-local seatYaw = 0  -- heading kept while seated (riders are not spun by camera turns)
+local seatYaw = 0
 
 -- Last values written to the fly constraints (skip redundant writes)
 local lastVel = nil
@@ -268,23 +323,14 @@ local lastAppliedYaw = nil
 local lastAttPos = nil
 
 local connections = {}
-
 local inputConn = nil
 local seatStateConnection = nil
 
 local previousReplicationFocus = nil
 local savedReplicationFocus = false
 
--- Input state (declared BEFORE any function that uses them)
-local keys = {
-    W = false,
-    A = false,
-    S = false,
-    D = false,
-    Up = false,
-    Down = false,
-}
-
+-- Mobile on-screen buttons (keyboard is polled, see isActionDown)
+local touchKeys = { W = false, A = false, S = false, D = false, Up = false, Down = false }
 local heldInputs = {}
 
 --==================================================
@@ -300,9 +346,31 @@ end
 local function clearKeys()
     table.clear(heldInputs)
 
-    for k in pairs(keys) do
-        keys[k] = false
+    for k in pairs(touchKeys) do
+        touchKeys[k] = false
     end
+end
+
+--- True while the action's key (or its mobile button) is held.
+--- Polling instead of event flags means a missed InputEnded can never
+--- leave a direction "stuck".
+local function isActionDown(action)
+    if touchKeys[action] then
+        return true
+    end
+
+    -- Ignore the keyboard while typing in chat / a TextBox
+    if UIS:GetFocusedTextBox() then
+        return false
+    end
+
+    for _, code in ipairs(CONFIG.MOVE_KEYS[action]) do
+        if UIS:IsKeyDown(code) then
+            return true
+        end
+    end
+
+    return false
 end
 
 --==================================================
@@ -332,16 +400,16 @@ local function isSeated()
 end
 
 --==================================================
--- BLOCK SPACE WHILE SEATED
+-- BLOCK JUMP WHILE SEATED
 --==================================================
 
 local SPACE_ACTION = randomName()
 
+-- Space is only sunk (so it can't kick us off the seat); the fly code reads
+-- it through UIS:IsKeyDown, which is unaffected by sinking.
 CAS:BindActionAtPriority(
     SPACE_ACTION,
-    function(_, state)
-        keys.Up = state == Enum.UserInputState.Begin
-
+    function()
         if isSeated() then
             return Enum.ContextActionResult.Sink
         end
@@ -353,7 +421,7 @@ CAS:BindActionAtPriority(
     KC.Space
 )
 
--- Also prevent mobile JumpRequest from exiting the seat
+-- Mobile jump button
 connect(UIS.JumpRequest, function()
     if isSeated() then
         local hum = getHumanoid()
@@ -375,7 +443,6 @@ pcall(function()
     LP.ReplicationFocus = Workspace
 end)
 
--- Resolved once; used by the fly loop (SimulationRadius)
 local setHidden = type(sethiddenproperty) == "function"
     and sethiddenproperty
     or nil
@@ -403,28 +470,20 @@ local PlayerGui = LP:WaitForChild("PlayerGui")
 --==================================================
 
 local function addCorner(obj, radius)
-    local c = Instance.new("UICorner")
-    c.CornerRadius = UDim.new(0, radius)
-    c.Parent = obj
+    return new("UICorner", { CornerRadius = UDim.new(0, radius) }, obj)
 end
 
 local function createButton(text, size, position, parent)
-    local b = Instance.new("TextButton")
-
-    b.Name = randomName()
-    b.Text = text
-
-    b.Size = size
-    b.Position = position
-
-    b.BackgroundColor3 = COLOR_OFF
-    b.TextColor3 = Color3.new(1, 1, 1)
-
-    b.Font = Enum.Font.GothamBold
-    b.TextSize = 13
-
-    b.AutoButtonColor = true
-    b.Parent = parent
+    local b = new("TextButton", {
+        Text = text,
+        Size = size,
+        Position = position,
+        BackgroundColor3 = COLOR_OFF,
+        TextColor3 = WHITE,
+        Font = Enum.Font.GothamBold,
+        TextSize = 13,
+        AutoButtonColor = true,
+    }, parent)
 
     addCorner(b, 7)
 
@@ -432,33 +491,22 @@ local function createButton(text, size, position, parent)
 end
 
 local function createLabel(size, position, text, font, textSize, color, parent)
-    local l = Instance.new("TextLabel")
-    l.Name = randomName()
-
-    l.Size = size
-    l.Position = position
-    l.BackgroundTransparency = 1
-
-    l.Text = text
-    l.TextColor3 = color
-
-    l.Font = font
-    l.TextSize = textSize
-
-    l.Parent = parent
-
-    return l
+    return new("TextLabel", {
+        Size = size,
+        Position = position,
+        BackgroundTransparency = 1,
+        Text = text,
+        TextColor3 = color,
+        Font = font,
+        TextSize = textSize,
+    }, parent)
 end
 
 --==================================================
 -- MAIN GUI
 --==================================================
 
-local gui = Instance.new("ScreenGui")
-
-gui.Name = randomName()
-gui.ResetOnSpawn = false
-gui.DisplayOrder = 100
+local gui = new("ScreenGui", { ResetOnSpawn = false, DisplayOrder = 100 })
 
 local protectGui = (type(syn) == "table" and syn.protect_gui)
     or (type(protect_gui) == "function" and protect_gui)
@@ -474,29 +522,24 @@ end) then
     gui.Parent = PlayerGui
 end
 
-local main = Instance.new("Frame")
-
-main.Name = randomName()
-main.Size = UDim2.fromOffset(190, 224)
-main.Position = UDim2.new(0, 20, 0.35, 0)
-
-main.BackgroundColor3 = Color3.fromRGB(24, 24, 32)
-
-main.Active = true
-main.Parent = gui
+local main = new("Frame", {
+    Size = UDim2.fromOffset(190, 224),
+    Position = UDim2.new(0, 20, 0.35, 0),
+    BackgroundColor3 = Color3.fromRGB(24, 24, 32),
+    Active = true,
+}, gui)
 
 addCorner(main, 10)
 
-local WHITE = Color3.new(1, 1, 1)
-local GREY = Color3.fromRGB(180, 180, 190)
-
-createLabel(
+-- Title bar = drag handle
+local titleBar = createLabel(
     UDim2.new(1, 0, 0, 27), UDim2.new(),
     "FLYSEAT",
     Enum.Font.GothamBold, 12, WHITE, main
 )
 
--- FLY BUTTON
+titleBar.Active = true
+
 local flyButton = createButton(
     LABELS.FLY_OFF,
     UDim2.new(1, -16, 0, 31),
@@ -504,13 +547,7 @@ local flyButton = createButton(
     main
 )
 
--- SPEED
-local minus = createButton(
-    "-",
-    UDim2.fromOffset(42, 27),
-    UDim2.fromOffset(8, 69),
-    main
-)
+local minus = createButton("-", UDim2.fromOffset(42, 27), UDim2.fromOffset(8, 69), main)
 
 local speedLabel = createLabel(
     UDim2.fromOffset(82, 27), UDim2.fromOffset(54, 69),
@@ -518,14 +555,8 @@ local speedLabel = createLabel(
     Enum.Font.GothamBold, 14, WHITE, main
 )
 
-local plus = createButton(
-    "+",
-    UDim2.fromOffset(42, 27),
-    UDim2.fromOffset(140, 69),
-    main
-)
+local plus = createButton("+", UDim2.fromOffset(42, 27), UDim2.fromOffset(140, 69), main)
 
--- SEAT PICKER
 local seatButton = createButton(
     LABELS.SEAT_OFF,
     UDim2.new(1, -16, 0, 31),
@@ -533,7 +564,6 @@ local seatButton = createButton(
     main
 )
 
--- EXIT SEAT
 local exitButton = createButton(
     LABELS.EXIT,
     UDim2.new(1, -16, 0, 31),
@@ -543,10 +573,9 @@ local exitButton = createButton(
 
 exitButton.BackgroundColor3 = Color3.fromRGB(180, 55, 55)
 
--- STATUS
 local statusLabel = createLabel(
     UDim2.new(1, -12, 0, 23), UDim2.fromOffset(6, 180),
-    "NOT SEATED",
+    "READY",
     Enum.Font.Gotham, 11, GREY, main
 )
 
@@ -565,14 +594,18 @@ local function updateGUI()
     speedLabel.Text = tostring(speed)
 end
 
+--- Changes the fly speed, clamped to [MIN, MAX].
+local function changeSpeed(delta)
+    speed = mathClamp(speed + delta, CONFIG.SPEED.MIN, CONFIG.SPEED.MAX)
+    updateGUI()
+end
+
 --==================================================
 -- HIGHLIGHT (single reusable instance)
 --==================================================
 
-local GREEN = Color3.fromRGB(0, 255, 0)
-
 -- NOTE: a Highlight with no Adornee highlights its PARENT (Workspace = the
--- whole screen). So it is always disabled before the Adornee is cleared.
+-- whole screen), so it is always disabled before the Adornee is cleared.
 local function clearHighlight()
     if highlight then
         highlight.Enabled = false
@@ -581,7 +614,6 @@ local function clearHighlight()
 end
 
 --- Highlights `part` only if it is a valid, unanchored, non-character part.
---- Safe to call repeatedly: redundant writes are skipped.
 local function updateHighlight(part)
     local valid = part ~= nil
         and part.Parent ~= nil
@@ -601,22 +633,15 @@ local function updateHighlight(part)
         return
     end
 
-    -- (Re)create if missing or removed by the game
     if not highlight or not highlight.Parent then
-        highlight = Instance.new("Highlight")
-
-        highlight.Name = randomName()
-
-        highlight.FillColor = GREEN
-        highlight.FillTransparency = 0.5
-
-        highlight.OutlineColor = GREEN
-        highlight.OutlineTransparency = 0
-
-        -- Adornee is set BEFORE parenting so it never flashes the whole world
-        highlight.Enabled = false
-        highlight.Adornee = part
-        highlight.Parent = Workspace
+        highlight = new("Highlight", {
+            FillColor = GREEN,
+            FillTransparency = 0.5,
+            OutlineColor = GREEN,
+            OutlineTransparency = 0,
+            Enabled = false,
+            Adornee = part,  -- set BEFORE parenting
+        }, Workspace)
     end
 
     if highlight.Adornee ~= part then
@@ -628,15 +653,13 @@ local function updateHighlight(part)
     end
 end
 
---- Re-evaluates what is under the cursor (also called on a timer and on click,
---- so the highlight never goes stale when the camera/character moves
---- without mouse movement, or on touch devices where Mouse.Move never fires).
+--- Re-evaluates what is under the cursor (timer + click, so it never goes
+--- stale and also works on touch where Mouse.Move never fires).
 local function refreshHighlight()
     if not seatPickerEnabled then
         return
     end
 
-    -- A part is already picked: no highlight until the seat is released
     if currentSeat then
         clearHighlight()
         return
@@ -646,14 +669,13 @@ local function refreshHighlight()
 end
 
 --==================================================
--- SEAT CLEANUP
+-- LIGHTEN / ANTI-GRAVITY
 --==================================================
 
--- Parts made light: part -> original CustomPhysicalProperties (false = default)
+-- part -> original CustomPhysicalProperties (false = default)
 local lightened = {}
-local lightenSeen = setmetatable({}, { __mode = "k" })  -- parts already evaluated
+local lightenSeen = setmetatable({}, { __mode = "k" })
 
--- Weightless part: an upward VectorForce equal to the assembly's weight
 local antiGen = 0
 local antiObjects = {}
 
@@ -661,12 +683,13 @@ local function stopAntiGravity()
     antiGen += 1
 
     for _, obj in ipairs(antiObjects) do
-        pcall(obj.Destroy, obj)
+        destroy(obj)
     end
 
     table.clear(antiObjects)
 end
 
+--- Upward VectorForce equal to the assembly's weight (weightless part).
 local function startAntiGravity(part)
     if not CONFIG.LIGHTEN.ANTI_GRAVITY then
         return
@@ -674,17 +697,14 @@ local function startAntiGravity(part)
 
     stopAntiGravity()
 
-    local att = Instance.new("Attachment")
-    att.Name = randomName()
-    att.Parent = part
+    local att = new("Attachment", nil, part)
 
-    local force = Instance.new("VectorForce")
-    force.Name = randomName()
-    force.Attachment0 = att
-    force.RelativeTo = Enum.ActuatorRelativeTo.World
-    force.ApplyAtCenterOfMass = true
-    force.Force = VEC_ZERO
-    force.Parent = part
+    local force = new("VectorForce", {
+        Attachment0 = att,
+        RelativeTo = Enum.ActuatorRelativeTo.World,
+        ApplyAtCenterOfMass = true,
+        Force = VEC_ZERO,
+    }, part)
 
     antiObjects[1] = att
     antiObjects[2] = force
@@ -702,7 +722,24 @@ local function startAntiGravity(part)
     end)
 end
 
+-- Workspace-wide lightening job (queue of parts, drained a few per frame)
+local GL = { gen = 0, conn = nil, queue = {}, head = 1 }
+
+local function stopGlobalLighten()
+    GL.gen += 1
+
+    if GL.conn then
+        GL.conn:Disconnect()
+        GL.conn = nil
+    end
+
+    table.clear(GL.queue)
+    GL.head = 1
+end
+
 local function restoreLightened()
+    stopGlobalLighten()
+
     for part, original in pairs(lightened) do
         pcall(function()
             part.CustomPhysicalProperties = original or nil
@@ -715,10 +752,7 @@ local function restoreLightened()
     stopAntiGravity()
 end
 
--- Lightens one loose part. Returns true if it changed.
--- UNIFORM: every part gets MIN_DENSITY, so nearby parts all weigh alike
--- (riders and the part they stand on keep a sane mass ratio).
--- Otherwise only parts heavier than TARGET_MASS are brought down to it.
+--- Lightens one loose part. Returns true if it changed.
 local function lightenOne(p, cfg)
     if lightenSeen[p] or p.Anchored then
         return false
@@ -754,7 +788,66 @@ local function lightenOne(p, cfg)
     return true
 end
 
--- The picked part and the parts welded to it (never characters)
+--- Lightens EVERY unanchored part in Workspace to MIN_DENSITY (0.01).
+--- Existing parts are queued once; parts added later are queued as they appear.
+--- Runs until the seat is released (restoreLightened -> stopGlobalLighten).
+local function startGlobalLighten()
+    local g = CONFIG.LIGHTEN.GLOBAL
+
+    if not (CONFIG.LIGHTEN.ENABLED and g.ENABLED) then
+        return
+    end
+
+    stopGlobalLighten()
+
+    local gen = GL.gen
+    local cfg = { MIN_DENSITY = CONFIG.LIGHTEN.MIN_DENSITY, UNIFORM = true }
+
+    local function enqueue(inst)
+        if inst:IsA("BasePart") then
+            GL.queue[#GL.queue + 1] = inst
+        end
+    end
+
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        enqueue(inst)
+    end
+
+    GL.conn = Workspace.DescendantAdded:Connect(enqueue)
+
+    task.spawn(function()
+        while gen == GL.gen do
+            local char = LP.Character
+            local handled = 0
+
+            while GL.head <= #GL.queue and handled < g.PER_FRAME do
+                local p = GL.queue[GL.head]
+                GL.head += 1
+                handled += 1
+
+                if p.Parent and not p.Anchored then
+                    local model = p.Parent
+                    local isCharacter = model:FindFirstChildOfClass("Humanoid") ~= nil
+                    local isMine = char and p:IsDescendantOf(char)
+
+                    if not isMine and (not isCharacter or g.INCLUDE_PLAYERS) then
+                        lightenOne(p, cfg)
+                    end
+                end
+            end
+
+            -- Queue drained: reset it so it doesn't grow forever
+            if GL.head > #GL.queue then
+                table.clear(GL.queue)
+                GL.head = 1
+            end
+
+            taskWait()
+        end
+    end)
+end
+
+--- The picked part and the parts welded to it (never characters).
 local function lightenPart(part)
     local cfg = CONFIG.LIGHTEN
 
@@ -781,14 +874,13 @@ local function lightenPart(part)
         lightenOne(p, cfg)
     end
 
-    -- Weightless while seated (removed on exit)
     startAntiGravity(part)
 end
 
--- Every loose part within NEARBY.RADIUS studs of the player (never characters)
 local nearbyParams = OverlapParams.new()
 nearbyParams.MaxParts = CONFIG.LIGHTEN.NEARBY.QUERY_MAX
 
+--- Every loose part within NEARBY.RADIUS studs (never your own character).
 local function lightenNearby()
     local cfg = CONFIG.LIGHTEN
     local nearby = cfg.NEARBY
@@ -834,6 +926,10 @@ local function lightenNearby()
     end
 end
 
+--==================================================
+-- SEAT CLEANUP
+--==================================================
+
 local function cleanupSeat(resetHumanoid)
     if seatStateConnection then
         seatStateConnection:Disconnect()
@@ -861,11 +957,11 @@ local function cleanupSeat(resetHumanoid)
             end
         end
 
-        pcall(oldSeat.Destroy, oldSeat)
+        destroy(oldSeat)
     end
 
     if tempSeat and tempSeat ~= oldSeat then
-        pcall(tempSeat.Destroy, tempSeat)
+        destroy(tempSeat)
     end
 
     restoreLightened()
@@ -877,7 +973,7 @@ local function cleanupSeat(resetHumanoid)
     end
 
     if charWeldInst then
-        pcall(charWeldInst.Destroy, charWeldInst)
+        destroy(charWeldInst)
         charWeldInst = nil
     end
 
@@ -958,7 +1054,7 @@ local function setupStandUpListener(hum, obj)
 end
 
 --==================================================
--- ORIGINAL SEAT LOGIC v3
+-- SEAT LOGIC
 --==================================================
 
 -- Short on-screen notice (status label) explaining why a pick was refused
@@ -976,10 +1072,10 @@ end
 local sitToken = 0
 
 --- Waits `t` seconds, then reports whether the sit operation is still valid.
---- @param token number        token captured when the operation started
---- @param t number            seconds to wait
+--- @param token number         token captured when the operation started
+--- @param t number             seconds to wait
 --- @param resetOnCancel boolean? undo partial work if the picker was disabled
---- @return boolean            true = keep going, false = cancelled
+--- @return boolean             true = keep going, false = cancelled
 local function sitSleep(token, t, resetOnCancel)
     taskWait(t)
 
@@ -994,144 +1090,66 @@ local function sitSleep(token, t, resetOnCancel)
     return false
 end
 
-local function sitOnPart(part)
-    if not seatPickerEnabled then return end
+--- Invisible, non-interactive seat part placed under the character.
+local function createSeatPart(className, cframe)
+    return new(className, {
+        Size = Vector3.new(2, 0.2, 2),
+        CFrame = cframe,
+        Anchored = true,
+        Transparency = 1,
+        CanCollide = false,
+        CanTouch = false,
+        CanQuery = false,
+        Massless = true,
+    }, Workspace)
+end
 
-    local char = getCharacter()
-    if not char then return end
+--- Common bookkeeping once a pick has succeeded.
+--- @param obj Instance the seat part / weld that now holds the character
+local function onPicked(hum, part, obj)
+    currentSeat = obj
+    pendingSeat = nil
 
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    local rootPart = char:FindFirstChild("HumanoidRootPart")
+    setupStandUpListener(hum, obj)
+    clearHighlight()
 
-    if not (hum and rootPart) then return end
+    if SUSPEND_PICKER then
+        suspendPicker()
+    end
 
+    pickedPart = part
+    lightenPart(part)
+    startGlobalLighten()
+    startPushGuard()
+end
+
+--- Checks that `part` can be picked; notifies the player when it can't.
+local function canPick(part, char, hum)
     if not part or not part.Parent then
-        return
+        return false
     end
 
     if part.Anchored then
         notify("ANCHORED - PICK AN UNANCHORED PART")
-        return
+        return false
     end
 
     if part:IsDescendantOf(char) then
-        return
+        return false
     end
 
     -- Prevent sitting on another real game seat
     if hum.SeatPart and hum.SeatPart ~= currentSeat then
         notify("STAND UP FROM THE GAME SEAT FIRST")
-        return
+        return false
     end
 
-    -- A new attempt supersedes (cancels) any older one still waiting
-    sitToken += 1
-    local token = sitToken
+    return true
+end
 
-    cleanupSeat(false)
-
-    -- ORIGINAL HUMANOID RESET
-    pcall(function()
-        hum.Sit = false
-
-        hum:ChangeState(HState.GettingUp)
-    end)
-
-    if not sitSleep(token, 0.25) or not part.Parent then
-        return
-    end
-
-    -- ORIGINAL DISTANCE HANDLING
-    local distance = (part.Position - rootPart.Position).Magnitude
-
-    if distance > 50 then
-        pcall(function()
-            char:PivotTo(
-                part.CFrame * CFrame.new(0, part.Size.Y / 2 + 5, 0)
-            )
-        end)
-
-        if not sitSleep(token, 0.15) then
-            return
-        end
-    end
-
-    if token ~= sitToken or not part.Parent then
-        return
-    end
-
-    -- ORIGINAL SIT POSITION
-    local sitPos = part.CFrame * CFrame.new(0, part.Size.Y / 2 + 2.5, 0)
-    local seatCFrame = sitPos - Vector3.new(0, 2.5, 0)
-
-    -- METHOD 1: SEAT:SIT
-    local seat = Instance.new("Seat")
-
-    seat.Name = randomName()
-    seat.Size = Vector3.new(2, 0.2, 2)
-
-    seat.CFrame = seatCFrame
-
-    seat.Anchored = true
-    seat.Transparency = 1
-
-    seat.CanCollide = false
-    seat.CanTouch = false
-    seat.CanQuery = false
-
-    seat.Massless = true
-    seat.Parent = Workspace
-
-    pendingSeat = seat
-
-    pcall(seat.Sit, seat, hum)
-
-    if not sitSleep(token, 0.15, true) then
-        return
-    end
-
-    if hum.SeatPart == seat then
-        -- ORIGINAL METHOD 1 SUCCESS
-        if not FREEZE_PART then
-            local weld = Instance.new("WeldConstraint")
-
-            weld.Name = randomName()
-            weld.Part0 = seat
-            weld.Part1 = part
-
-            weld.Parent = seat
-
-            if not sitSleep(token, 0.05, true) then
-                return
-            end
-
-            seat.Anchored = false
-        end
-
-        currentSeat = seat
-        pendingSeat = nil
-
-        setupStandUpListener(hum, seat)
-
-        clearHighlight()
-
-        if SUSPEND_PICKER then
-            suspendPicker()
-        end
-
-        pickedPart = part
-        lightenPart(part)
-        startPushGuard()
-
-        print("[FlySeat] Sit successful (Seat:Sit)")
-        return
-    end
-
-    -- METHOD 2: ORIGINAL WELD FALLBACK
+--- Method 2: no Seat. Weld the character to the part and force the Seated state.
+local function weldFallback(token, part, char, hum, rootPart, sitPos, seatCFrame)
     print("[FlySeat] Seat:Sit failed -> Weld fallback")
-
-    seat:Destroy()
-    pendingSeat = nil
 
     if not sitSleep(token, 0.05) or not part.Parent then
         return
@@ -1153,77 +1171,115 @@ local function sitOnPart(part)
         return
     end
 
+    local holder
+
     if FREEZE_PART then
-        local frozenSeat = Instance.new("Part")
+        local frozenSeat = createSeatPart("Part", seatCFrame)
 
-        frozenSeat.Name = randomName()
-        frozenSeat.Size = Vector3.new(2, 0.2, 2)
+        new("WeldConstraint", { Part0 = frozenSeat, Part1 = part }, frozenSeat)
 
-        frozenSeat.CFrame = seatCFrame
+        charWeldInst = new("Weld", {
+            Part0 = frozenSeat,
+            Part1 = rootPart,
+            C0 = CFrame.new(0, 2.5, 0),
+        }, rootPart)
 
-        frozenSeat.Anchored = true
-        frozenSeat.Transparency = 1
-
-        frozenSeat.CanCollide = false
-        frozenSeat.CanTouch = false
-        frozenSeat.CanQuery = false
-
-        frozenSeat.Parent = Workspace
-
-        local partWeld = Instance.new("WeldConstraint")
-
-        partWeld.Name = randomName()
-        partWeld.Part0 = frozenSeat
-        partWeld.Part1 = part
-
-        partWeld.Parent = frozenSeat
-
-        currentSeat = frozenSeat
-
-        local charWeld = Instance.new("Weld")
-
-        charWeld.Name = randomName()
-        charWeld.Part0 = frozenSeat
-        charWeld.Part1 = rootPart
-
-        charWeld.C0 = CFrame.new(0, 2.5, 0)
-        charWeld.Parent = rootPart
-
-        charWeldInst = charWeld
-
-        setupStandUpListener(hum, frozenSeat)
-
+        holder = frozenSeat
     else
-        local weld = Instance.new("Weld")
-
-        weld.Name = randomName()
-        weld.Part0 = part
-        weld.Part1 = rootPart
-
-        weld.C0 = CFrame.new(0, part.Size.Y / 2 + 2.5, 0)
-
-        weld.Parent = rootPart
-
-        currentSeat = weld
-
-        setupStandUpListener(hum, weld)
+        holder = new("Weld", {
+            Part0 = part,
+            Part1 = rootPart,
+            C0 = CFrame.new(0, part.Size.Y / 2 + 2.5, 0),
+        }, rootPart)
     end
 
-    clearHighlight()
-
-    if SUSPEND_PICKER then
-        suspendPicker()
-    end
-
-    pickedPart = part
-    lightenPart(part)
-    startPushGuard()
+    onPicked(hum, part, holder)
 
     print("[FlySeat] Sit successful (Weld)")
 end
 
+local function sitOnPart(part)
+    if not seatPickerEnabled then return end
+
+    local char = getCharacter()
+    if not char then return end
+
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local rootPart = char:FindFirstChild("HumanoidRootPart")
+
+    if not (hum and rootPart) then return end
+    if not canPick(part, char, hum) then return end
+
+    -- A new attempt supersedes (cancels) any older one still waiting
+    sitToken += 1
+    local token = sitToken
+
+    cleanupSeat(false)
+
+    pcall(function()
+        hum.Sit = false
+
+        hum:ChangeState(HState.GettingUp)
+    end)
+
+    if not sitSleep(token, 0.25) or not part.Parent then
+        return
+    end
+
+    -- Too far away: teleport next to the part first
+    if (part.Position - rootPart.Position).Magnitude > 50 then
+        pcall(function()
+            char:PivotTo(part.CFrame * CFrame.new(0, part.Size.Y / 2 + 5, 0))
+        end)
+
+        if not sitSleep(token, 0.15) then
+            return
+        end
+    end
+
+    if token ~= sitToken or not part.Parent then
+        return
+    end
+
+    local sitPos = part.CFrame * CFrame.new(0, part.Size.Y / 2 + 2.5, 0)
+    local seatCFrame = sitPos - Vector3.new(0, 2.5, 0)
+
+    -- METHOD 1: Seat:Sit
+    local seat = createSeatPart("Seat", seatCFrame)
+    pendingSeat = seat
+
+    pcall(seat.Sit, seat, hum)
+
+    if not sitSleep(token, 0.15, true) then
+        return
+    end
+
+    if hum.SeatPart == seat then
+        if not FREEZE_PART then
+            new("WeldConstraint", { Part0 = seat, Part1 = part }, seat)
+
+            if not sitSleep(token, 0.05, true) then
+                return
+            end
+
+            seat.Anchored = false
+        end
+
+        onPicked(hum, part, seat)
+
+        print("[FlySeat] Sit successful (Seat:Sit)")
+        return
+    end
+
+    -- METHOD 2
+    destroy(seat)
+    pendingSeat = nil
+
+    weldFallback(token, part, char, hum, rootPart, sitPos, seatCFrame)
+end
+
 --==================================================
--- EXIT SEAT BUTTON
+-- EXIT SEAT
 --==================================================
 
 local function exitSeat()
@@ -1263,7 +1319,6 @@ local function setSeatPicker(state)
                 return
             end
 
-            -- Sync the highlight with the part that is about to be used
             refreshHighlight()
 
             local target = Mouse.Target
@@ -1272,7 +1327,6 @@ local function setSeatPicker(state)
                 sitOnPart(target)
             end
         end)
-
     else
         if inputConn then
             inputConn:Disconnect()
@@ -1281,11 +1335,10 @@ local function setSeatPicker(state)
 
         clearHighlight()
 
-        -- Cancel only an unfinished seat operation.
-        -- Do not kick the player out of the current seat.
+        -- Cancel only an unfinished seat operation; never kick the player
+        -- out of the current seat.
         if pendingSeat then
-            pcall(pendingSeat.Destroy, pendingSeat)
-
+            destroy(pendingSeat)
             pendingSeat = nil
         end
     end
@@ -1312,14 +1365,14 @@ resumePicker = function()
 end
 
 --==================================================
--- FLY PHYSICS CLEANUP
+-- FLY PHYSICS
 --==================================================
 
 local function removeFlyPhysics()
-    if velocity then pcall(velocity.Destroy, velocity) end
-    if orientation then pcall(orientation.Destroy, orientation) end
-    if alignPos then pcall(alignPos.Destroy, alignPos) end
-    if attachment then pcall(attachment.Destroy, attachment) end
+    destroy(velocity)
+    destroy(orientation)
+    destroy(alignPos)
+    destroy(attachment)
 
     velocity = nil
     orientation = nil
@@ -1334,24 +1387,16 @@ local function removeFlyPhysics()
     lastAttPos = nil
 end
 
---==================================================
--- FLAT YAW
---==================================================
-
+--- Heading (yaw) of a CFrame, ignoring near-vertical look vectors.
 local function getFlatYaw(cf)
     local look = cf.LookVector
 
-    -- Only update when the look vector isn't (nearly) vertical
     if look.X * look.X + look.Z * look.Z > 0.000001 then
         lastYaw = mathAtan2(-look.X, -look.Z)
     end
 
     return lastYaw
 end
-
---==================================================
--- ASSEMBLY CONTROL
---==================================================
 
 -- Constraints stay on the HumanoidRootPart: they act on the whole welded
 -- assembly anyway, and (unlike the assembly root part) the root can't be
@@ -1375,51 +1420,35 @@ local function updateActuatorAssembly(force)
 end
 
 local function createFlyPhysics()
-    attachment = Instance.new("Attachment")
-    attachment.Name = randomName()
-    attachment.Parent = root
+    attachment = new("Attachment", nil, root)
 
-    velocity = Instance.new("LinearVelocity")
-    velocity.Name = randomName()
+    velocity = new("LinearVelocity", {
+        Attachment0 = attachment,
+        RelativeTo = Enum.ActuatorRelativeTo.World,
+        VelocityConstraintMode = Enum.VelocityConstraintMode.Vector,
+        ForceLimitsEnabled = false,
+        VectorVelocity = VEC_ZERO,
+    }, root)
 
-    velocity.Attachment0 = attachment
-    velocity.RelativeTo = Enum.ActuatorRelativeTo.World
+    orientation = new("AlignOrientation", {
+        Mode = Enum.OrientationAlignmentMode.OneAttachment,
+        Attachment0 = attachment,
+        RigidityEnabled = false,
+        Responsiveness = UPRIGHT_RESPONSIVENESS,
+        MaxTorque = UPRIGHT_MAX_TORQUE,
+        MaxAngularVelocity = UPRIGHT_MAX_ANGULAR,
+        Enabled = true,
+    }, root)
 
-    velocity.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
-
-    velocity.ForceLimitsEnabled = false
-    velocity.VectorVelocity = VEC_ZERO
-
-    velocity.Parent = root
-
-    orientation = Instance.new("AlignOrientation")
-    orientation.Name = randomName()
-
-    orientation.Mode = Enum.OrientationAlignmentMode.OneAttachment
-
-    orientation.Attachment0 = attachment
-
-    orientation.RigidityEnabled = false
-    orientation.Responsiveness = UPRIGHT_RESPONSIVENESS
-    orientation.MaxTorque = UPRIGHT_MAX_TORQUE
-    orientation.MaxAngularVelocity = UPRIGHT_MAX_ANGULAR
-
-    orientation.Enabled = true
-    orientation.Parent = root
-
-    alignPos = Instance.new("AlignPosition")
-    alignPos.Name = randomName()
-
-    alignPos.Mode = Enum.PositionAlignmentMode.OneAttachment
-    alignPos.Attachment0 = attachment
-
-    alignPos.RigidityEnabled = CONFIG.HOLD.RIGID
-    alignPos.MaxForce = mathHuge
-    alignPos.MaxVelocity = CONFIG.HOLD.MAX_SPEED
-    alignPos.Responsiveness = CONFIG.HOLD.RESPONSIVENESS
-
-    alignPos.Enabled = false
-    alignPos.Parent = root
+    alignPos = new("AlignPosition", {
+        Mode = Enum.PositionAlignmentMode.OneAttachment,
+        Attachment0 = attachment,
+        RigidityEnabled = CONFIG.HOLD.RIGID,
+        MaxForce = mathHuge,
+        MaxVelocity = CONFIG.HOLD.MAX_SPEED,
+        Responsiveness = CONFIG.HOLD.RESPONSIVENESS,
+        Enabled = false,
+    }, root)
 
     lastYaw = getFlatYaw(root.CFrame)
 
@@ -1430,24 +1459,17 @@ local function createFlyPhysics()
     updateActuatorAssembly(true)
 end
 
---==================================================
--- ANTI TILT / YAW ONLY
---==================================================
-
+--- Removes pitch/roll spin, keeps (clamped) yaw.
 local function stabilizeAssembly(assembly, seated, dt)
     if not assembly or not assembly.Parent then
         return
     end
 
     local angular = assembly.AssemblyAngularVelocity
-
     local factor = mathExp(-(seated and SEATED_DAMPING or NORMAL_DAMPING) * dt)
 
-    -- Remove pitch and roll
     local x = angular.X * factor
     local z = angular.Z * factor
-
-    -- Keep yaw rotation, but limit excessive spinning
     local y = mathClamp(angular.Y, -MAX_YAW_RATE, MAX_YAW_RATE)
 
     if mathAbs(x) > 0.01
@@ -1469,20 +1491,21 @@ local simTimer = 0
 local comTimer = 0
 local stabTimer = 0
 local lastSeatedState = nil
-local smoothVel = Vector3.zero
+local smoothVel = VEC_ZERO
 
-local STATUS_INTERVAL = CONFIG.INTERVALS.STATUS
-local SIM_INTERVAL = CONFIG.INTERVALS.SIM_RADIUS
-local COM_INTERVAL = CONFIG.INTERVALS.CENTER_OF_MASS
-local COM_INTERVAL_SEATED = CONFIG.INTERVALS.CENTER_OF_MASS_SEATED
+local INT = CONFIG.INTERVALS
+local STATUS_INTERVAL = INT.STATUS
+local SIM_INTERVAL = INT.SIM_RADIUS
+local COM_INTERVAL = INT.CENTER_OF_MASS
+local COM_INTERVAL_SEATED = INT.CENTER_OF_MASS_SEATED
+local STAB_INTERVAL = INT.STABILIZE
+local HIGHLIGHT_INTERVAL = INT.HIGHLIGHT
 local SPEED_SMOOTHING = CONFIG.SPEED.SMOOTHING
-local STAB_INTERVAL = CONFIG.INTERVALS.STABILIZE
-local HIGHLIGHT_INTERVAL = CONFIG.INTERVALS.HIGHLIGHT
 local HOLD_ENABLED = CONFIG.HOLD.ENABLED
 local HOLD_DELAY = CONFIG.HOLD.DELAY
 local HOLD_SNAP = CONFIG.HOLD.SNAP_DISTANCE
 
--- The fly loop is connected only while fly is ON (defined further below)
+-- The fly loop is connected only while fly is ON
 local flyStep
 local flyConn = nil
 
@@ -1524,7 +1547,6 @@ local function setFly(state)
         smoothVel = VEC_ZERO
 
         flyConn = RunService.Heartbeat:Connect(flyStep)
-
     else
         local wasSeated = isSeated()
 
@@ -1536,7 +1558,6 @@ local function setFly(state)
             flyConn = nil
         end
 
-
         removeFlyPhysics()
 
         if root and root.Parent then
@@ -1547,11 +1568,7 @@ local function setFly(state)
         end
 
         if humanoid and humanoid.Parent then
-            if oldAutoRotate ~= nil then
-                humanoid.AutoRotate = oldAutoRotate
-            else
-                humanoid.AutoRotate = true
-            end
+            humanoid.AutoRotate = oldAutoRotate ~= false
 
             if humanoid.Health > 0 and not wasSeated then
                 humanoid:ChangeState(HState.GettingUp)
@@ -1604,14 +1621,13 @@ end
 -- UI LOOP (always) + FLY LOOP (only while flying)
 --==================================================
 
--- Camera cached; refreshed only when Workspace.CurrentCamera changes
 local camera = Workspace.CurrentCamera
 
 connect(Workspace:GetPropertyChangedSignal("CurrentCamera"), function()
     camera = Workspace.CurrentCamera
 end)
 
--- Light UI loop: status text + seat-picker highlight
+-- Light UI loop: status text, seat-picker highlight, nearby lightening
 connect(RunService.Heartbeat, function(dt)
     statusTimer += dt
 
@@ -1629,7 +1645,6 @@ connect(RunService.Heartbeat, function(dt)
         end
     end
 
-    -- Lighten loose parts around you while a part is picked
     if currentSeat and CONFIG.LIGHTEN.ENABLED and CONFIG.LIGHTEN.NEARBY.ENABLED then
         nearbyTimer += dt
 
@@ -1642,7 +1657,24 @@ connect(RunService.Heartbeat, function(dt)
     end
 end)
 
--- Fly loop: connected in setFly(true), disconnected in setFly(false)
+--- Reads the movement keys and returns the (unnormalized) world direction.
+local function readDirection(cf)
+    local direction = VEC_ZERO
+
+    if isActionDown("W") then direction += cf.LookVector end
+    if isActionDown("S") then direction -= cf.LookVector end
+    if isActionDown("A") then direction -= cf.RightVector end
+    if isActionDown("D") then direction += cf.RightVector end
+    if isActionDown("Up") then direction += VEC_Y end
+    if isActionDown("Down") then direction -= VEC_Y end
+
+    if direction.Magnitude > 1 then
+        direction = direction.Unit
+    end
+
+    return direction
+end
+
 local function flyStepBody(dt)
     if not flying then
         return
@@ -1694,31 +1726,26 @@ local function flyStepBody(dt)
     end
 
     local cf = camera.CFrame
-    local direction = VEC_ZERO
-
-    if keys.W then direction += cf.LookVector end
-    if keys.S then direction -= cf.LookVector end
-    if keys.A then direction -= cf.RightVector end
-    if keys.D then direction += cf.RightVector end
-    if keys.Up then direction += VEC_Y end
-    if keys.Down then direction -= VEC_Y end
-
-    if direction.Magnitude > 1 then
-        direction = direction.Unit
-    end
+    local direction = readDirection(cf)
 
     local seated = isSeated()
 
     -- Re-read center of mass only on seat change or every COM_INTERVAL
     local force = lastSeatedState ~= seated
 
-    -- Capture the heading the moment we become seated
+    -- Heading is captured the moment we become seated
     if seated and not lastSeatedState then
         local look = root.CFrame.LookVector
 
         if look.X * look.X + look.Z * look.Z > 0.000001 then
             seatYaw = mathAtan2(-look.X, -look.Z)
         end
+    end
+
+    -- Left the seat while flying: the exit puts the humanoid in GettingUp,
+    -- so switch it back to Physics or it fights the fly constraints.
+    if lastSeatedState and not seated then
+        pcall(humanoid.ChangeState, humanoid, HState.Physics)
     end
 
     lastSeatedState = seated
@@ -1736,10 +1763,8 @@ local function flyStepBody(dt)
         return
     end
 
-    -- Speed control, eased: abrupt velocity jumps would jerk riders on the part
-    local inputVel = direction
-        * (seated and mathMin(speed, SEATED_SPEED_CAP) or speed)
-
+    -- Eased speed: abrupt velocity jumps would jerk riders on the part
+    local inputVel = direction * (seated and mathMin(speed, SEATED_SPEED_CAP) or speed)
     local wanted = inputVel.Magnitude
 
     local ease = SPEED_SMOOTHING > 0 and (1 - mathExp(-SPEED_SMOOTHING * dt)) or 1
@@ -1756,7 +1781,7 @@ local function flyStepBody(dt)
     end
 
     -- Position hold: while seated and idle, pull the assembly back to where it
-    -- stopped (velocity lock alone lets repeated pushes accumulate as drift)
+    -- stopped (a velocity lock alone lets repeated pushes accumulate as drift)
     if HOLD_ENABLED and seated and wanted < 0.01 and smoothVel.Magnitude < 1 then
         idleTimer += dt
 
@@ -1802,18 +1827,16 @@ local function flyStepBody(dt)
         orientation.Enabled = true
     end
 
-    -- Keep assembly upright, only yaw is allowed
-    if orientation then
-        local yaw = getFlatYaw(cf)
+    -- Keep the assembly upright; only yaw is allowed
+    local yaw = getFlatYaw(cf)
 
-        if seated and not ROTATE_SEATED then
-            yaw = seatYaw
-        end
+    if seated and not ROTATE_SEATED then
+        yaw = seatYaw
+    end
 
-        if yaw ~= lastAppliedYaw then
-            orientation.CFrame = CFAngles(0, yaw, 0)
-            lastAppliedYaw = yaw
-        end
+    if yaw ~= lastAppliedYaw then
+        orientation.CFrame = CFAngles(0, yaw, 0)
+        lastAppliedYaw = yaw
     end
 
     -- Anti tilt and anti spin (30 Hz, damping uses the accumulated dt)
@@ -1843,64 +1866,36 @@ flyStep = function(dt)
 end
 
 --==================================================
--- KEYBOARD
+-- KEYBOARD (hotkeys only; movement is polled)
 --==================================================
-
-local FLY_TOGGLE_KEY = CONFIG.KEYS.FLY
-local SEAT_TOGGLE_KEY = CONFIG.KEYS.SEAT_PICKER
-local EXIT_SEAT_KEY = CONFIG.KEYS.EXIT_SEAT
-
--- key code -> movement action
-local keyMap = {}
-
-for action, codes in pairs(CONFIG.MOVE_KEYS) do
-    for _, code in ipairs(codes) do
-        keyMap[code] = action
-    end
-end
 
 connect(UIS.InputBegan, function(input, processed)
     if processed then return end
 
-    -- PC hotkey: toggle fly
-    if input.KeyCode == FLY_TOGGLE_KEY then
+    local code = input.KeyCode
+
+    if code == K.FLY then
         setFly(not flying)
-        return
-    end
-
-    -- PC hotkey: toggle Seat Picker
-    if input.KeyCode == SEAT_TOGGLE_KEY then
+    elseif code == K.SEAT_PICKER then
         setSeatPicker(not seatPickerEnabled)
-        return
-    end
-
-    -- PC hotkey: exit seat
-    if input.KeyCode == EXIT_SEAT_KEY then
+    elseif code == K.EXIT_SEAT then
         if currentSeat or pendingSeat or isSeated() then
             exitSeat()
         end
-
-        return
-    end
-
-    local key = keyMap[input.KeyCode]
-
-    if key then
-        keys[key] = true
+    elseif code == K.SPEED_UP then
+        changeSpeed(CONFIG.SPEED.STEP)
+    elseif code == K.SPEED_DOWN then
+        changeSpeed(-CONFIG.SPEED.STEP)
+    elseif code == K.TOGGLE_GUI then
+        main.Visible = not main.Visible
     end
 end)
 
 connect(UIS.InputEnded, function(input)
-    local key = keyMap[input.KeyCode]
+    local action = heldInputs[input]
 
-    if key then
-        keys[key] = false
-    end
-
-    local mobileKey = heldInputs[input]
-
-    if mobileKey then
-        keys[mobileKey] = false
+    if action then
+        touchKeys[action] = false
         heldInputs[input] = nil
     end
 end)
@@ -1911,53 +1906,48 @@ connect(UIS.WindowFocusReleased, clearKeys)
 -- MOBILE CONTROLS
 --==================================================
 
-local mobile = Instance.new("Frame")
+do
+    local mobile = new("Frame", {
+        Size = UDim2.fromOffset(160, 145),
+        Position = UDim2.new(1, -175, 1, -165),
+        BackgroundTransparency = 1,
+        Visible = UIS.TouchEnabled,
+    }, gui)
 
-mobile.Name = randomName()
-mobile.Size = UDim2.fromOffset(160, 145)
+    local BUTTON_SIZE = UDim2.fromOffset(48, 42)
 
-mobile.Position = UDim2.new(1, -175, 1, -165)
+    local function holdButton(text, action, x, y)
+        local b = createButton(text, BUTTON_SIZE, UDim2.fromOffset(x, y), mobile)
 
-mobile.BackgroundTransparency = 1
-mobile.Visible = UIS.TouchEnabled
+        connect(b.InputBegan, function(input)
+            local t = input.UserInputType
 
-mobile.Parent = gui
+            if t == UIT.Touch or t == UIT.MouseButton1 then
+                touchKeys[action] = true
+                heldInputs[input] = action
+            end
+        end)
+    end
 
-local BUTTON_SIZE = UDim2.fromOffset(48, 42)
-
-local function holdButton(text, key, x, y)
-    local b = createButton(
-        text,
-        BUTTON_SIZE,
-        UDim2.fromOffset(x, y),
-        mobile
-    )
-
-    connect(b.InputBegan, function(input)
-        local t = input.UserInputType
-
-        if t == UIT.Touch or t == UIT.MouseButton1 then
-            keys[key] = true
-            heldInputs[input] = key
-        end
-    end)
+    holdButton("W", "W", 56, 0)
+    holdButton("A", "A", 4, 47)
+    holdButton("S", "S", 56, 47)
+    holdButton("D", "D", 108, 47)
+    holdButton("UP", "Up", 30, 94)
+    holdButton("DOWN", "Down", 82, 94)
 end
 
-holdButton("W", "W", 56, 0)
-holdButton("A", "A", 4, 47)
-holdButton("S", "S", 56, 47)
-holdButton("D", "D", 108, 47)
-holdButton("UP", "Up", 30, 94)
-holdButton("DOWN", "Down", 82, 94)
 
 --==================================================
--- CUSTOM DRAG (replaces deprecated Frame.Draggable)
+-- CUSTOM DRAG (title bar only)
 --==================================================
+
+local stopDrag  -- assigned inside the block below
 
 do
     local dragInput, dragStart, startPos, moveConn
 
-    local function stopDrag()
+    function stopDrag()
         dragInput = nil
 
         if moveConn then
@@ -1966,7 +1956,7 @@ do
         end
     end
 
-    connect(main.InputBegan, function(input)
+    connect(titleBar.InputBegan, function(input)
         local t = input.UserInputType
 
         if t ~= UIT.MouseButton1 and t ~= UIT.Touch then
@@ -1981,8 +1971,7 @@ do
 
         -- Mouse: any movement. Touch: only the finger that started the drag.
         moveConn = UIS.InputChanged:Connect(function(changed)
-            if changed.UserInputType ~= UIT.MouseMovement
-                and changed ~= dragInput then
+            if changed.UserInputType ~= UIT.MouseMovement and changed ~= dragInput then
                 return
             end
 
@@ -2007,48 +1996,34 @@ do
             end
         end)
     end)
-
-    connect(gui.Destroying, stopDrag)
 end
 
 --==================================================
 -- GUI BUTTON EVENTS
 --==================================================
 
-connect(flyButton.Activated, function()
-    setFly(not flying)
-end)
-
-connect(seatButton.Activated, function()
-    setSeatPicker(not seatPickerEnabled)
-end)
-
+connect(flyButton.Activated, function() setFly(not flying) end)
+connect(seatButton.Activated, function() setSeatPicker(not seatPickerEnabled) end)
 connect(exitButton.Activated, exitSeat)
-
-connect(minus.Activated, function()
-    speed = mathMax(minSpeed, speed - speedStep)
-
-    updateGUI()
-end)
-
-connect(plus.Activated, function()
-    speed = mathMin(maxSpeed, speed + speedStep)
-
-    updateGUI()
-end)
+connect(minus.Activated, function() changeSpeed(-CONFIG.SPEED.STEP) end)
+connect(plus.Activated, function() changeSpeed(CONFIG.SPEED.STEP) end)
 
 --==================================================
 -- RESPAWN
 --==================================================
 
-connect(LP.CharacterAdded, function()
+local function resetForCharacter()
     sitToken += 1
 
     setFly(false)
 
     cleanupSeat(false)
     clearHighlight()
-end)
+end
+
+-- Before the old character is removed (state is still valid) and after the new one spawns
+connect(LP.CharacterRemoving, resetForCharacter)
+connect(LP.CharacterAdded, resetForCharacter)
 
 --==================================================
 -- ANTI-PUSH (runs while a part is picked)
@@ -2059,147 +2034,143 @@ end)
 --  2. CanCollide = false on those parts every Stepped and Heartbeat, because
 --     Humanoids re-enable collision on their torso / head / root.
 
-local PUSH_RADIUS = CONFIG.PUSH.RADIUS
-local PUSH_REFRESH = CONFIG.PUSH.REFRESH
+do
+    local PUSH_RADIUS = CONFIG.PUSH.RADIUS
+    local PUSH_REFRESH = CONFIG.PUSH.REFRESH
 
-local PUSH_KEY_PARTS = {
-    HumanoidRootPart = true,
-    Head = true,
-    Torso = true,
-    UpperTorso = true,
-    LowerTorso = true,
-}
+    local PUSH_KEY_PARTS = {
+        HumanoidRootPart = true,
+        Head = true,
+        Torso = true,
+        UpperTorso = true,
+        LowerTorso = true,
+    }
 
-local pushTargets = {}
-local pushChanged = setmetatable({}, { __mode = "k" })  -- parts we turned non-collidable
-local pushPairs = {}   -- their part -> NoCollisionConstraint
-local pushTimer = 0
-local pushConns = {}
+    local pushTargets = {}
+    local pushChanged = setmetatable({}, { __mode = "k" })  -- parts we made non-collidable
+    local pushPairs = {}   -- their part -> NoCollisionConstraint
+    local pushTimer = 0
+    local pushConns = {}
 
-local function refreshPushTargets()
-    table.clear(pushTargets)
+    local function refreshPushTargets()
+        table.clear(pushTargets)
 
-    -- Drop constraints whose parts are gone
-    for part, constraint in pairs(pushPairs) do
-        if not part.Parent or not constraint.Parent then
-            pcall(constraint.Destroy, constraint)
-            pushPairs[part] = nil
+        -- Drop constraints whose parts are gone
+        for part, constraint in pairs(pushPairs) do
+            if not part.Parent or not constraint.Parent then
+                destroy(constraint)
+                pushPairs[part] = nil
+            end
         end
-    end
 
-    local char = LP.Character
-    local myRoot = char and char:FindFirstChild("HumanoidRootPart")
+        local char = LP.Character
+        local myRoot = char and char:FindFirstChild("HumanoidRootPart")
 
-    if not myRoot then
-        return
-    end
+        if not myRoot then
+            return
+        end
 
-    local origin = myRoot.Position
-    local created = 0
+        local origin = myRoot.Position
+        local created = 0
 
-    for _, plr in ipairs(Players:GetPlayers()) do
-        local c = plr ~= LP and plr.Character
-        local r = c and c:FindFirstChild("HumanoidRootPart")
+        for _, plr in ipairs(Players:GetPlayers()) do
+            local c = plr ~= LP and plr.Character
+            local r = c and c:FindFirstChild("HumanoidRootPart")
 
-        if r and (r.Position - origin).Magnitude <= PUSH_RADIUS then
-            for _, obj in ipairs(c:GetChildren()) do
-                if obj:IsA("BasePart") and (obj.CanCollide or PUSH_KEY_PARTS[obj.Name]) then
-                    pushTargets[#pushTargets + 1] = obj
+            if r and (r.Position - origin).Magnitude <= PUSH_RADIUS then
+                for _, obj in ipairs(c:GetChildren()) do
+                    if obj:IsA("BasePart") and (obj.CanCollide or PUSH_KEY_PARTS[obj.Name]) then
+                        pushTargets[#pushTargets + 1] = obj
 
-                    -- Layer 1: a constraint against the picked part
-                    if pickedPart and pickedPart.Parent
-                        and PUSH_KEY_PARTS[obj.Name]
-                        and not pushPairs[obj]
-                        and created < 20 then
+                        -- Layer 1: a constraint against the picked part
+                        if pickedPart and pickedPart.Parent
+                            and PUSH_KEY_PARTS[obj.Name]
+                            and not pushPairs[obj]
+                            and created < 20 then
 
-                        local ok, constraint = pcall(function()
-                            local nc = Instance.new("NoCollisionConstraint")
+                            local ok, constraint = pcall(new, "NoCollisionConstraint", {
+                                Part0 = obj,
+                                Part1 = pickedPart,
+                            }, pickedPart)
 
-                            nc.Name = randomName()
-                            nc.Part0 = obj
-                            nc.Part1 = pickedPart
-                            nc.Parent = pickedPart
-
-                            return nc
-                        end)
-
-                        if ok then
-                            pushPairs[obj] = constraint
-                            created += 1
+                            if ok then
+                                pushPairs[obj] = constraint
+                                created += 1
+                            end
                         end
                     end
                 end
             end
         end
     end
-end
 
-local function restorePush()
-    for _, constraint in pairs(pushPairs) do
-        pcall(constraint.Destroy, constraint)
-    end
-
-    for part in pairs(pushChanged) do
-        pcall(function()
-            part.CanCollide = true
-        end)
-    end
-
-    table.clear(pushPairs)
-    table.clear(pushChanged)
-    table.clear(pushTargets)
-end
-
--- Layer 2, applied twice per frame (Stepped and Heartbeat)
-local function pushApply()
-    for i = 1, #pushTargets do
-        local part = pushTargets[i]
-
-        if part.CanCollide then
-            part.CanCollide = false
-            pushChanged[part] = true
-        end
-    end
-end
-
-local function pushStep(_, dt)
-    if not currentSeat then
-        if next(pushChanged) or next(pushPairs) then
-            restorePush()
+    local function restorePush()
+        for _, constraint in pairs(pushPairs) do
+            destroy(constraint)
         end
 
-        return
+        for part in pairs(pushChanged) do
+            pcall(function()
+                part.CanCollide = true
+            end)
+        end
+
+        table.clear(pushPairs)
+        table.clear(pushChanged)
+        table.clear(pushTargets)
     end
 
-    pushTimer += dt
+    -- Layer 2, applied twice per frame (Stepped and Heartbeat)
+    local function pushApply()
+        for i = 1, #pushTargets do
+            local part = pushTargets[i]
 
-    if pushTimer >= PUSH_REFRESH then
-        pushTimer = 0
-        refreshPushTargets()
+            if part.CanCollide then
+                part.CanCollide = false
+                pushChanged[part] = true
+            end
+        end
     end
 
-    pushApply()
-end
+    local function pushStep(_, dt)
+        if not currentSeat then
+            if next(pushChanged) or next(pushPairs) then
+                restorePush()
+            end
 
-function startPushGuard()
-    if not CONFIG.PUSH.ENABLED or pushConns[1] then
-        return
+            return
+        end
+
+        pushTimer += dt
+
+        if pushTimer >= PUSH_REFRESH then
+            pushTimer = 0
+            refreshPushTargets()
+        end
+
+        pushApply()
     end
 
-    pushTimer = PUSH_REFRESH
+    function startPushGuard()
+        if not CONFIG.PUSH.ENABLED or pushConns[1] then
+            return
+        end
 
-    pushConns[1] = RunService.Stepped:Connect(pushStep)
-    pushConns[2] = RunService.Heartbeat:Connect(pushApply)
-end
+        pushTimer = PUSH_REFRESH
 
-function stopPushGuard()
-    for i = 1, #pushConns do
-        pushConns[i]:Disconnect()
+        pushConns[1] = RunService.Stepped:Connect(pushStep)
+        pushConns[2] = RunService.Heartbeat:Connect(pushApply)
     end
 
-    table.clear(pushConns)
+    function stopPushGuard()
+        for i = 1, #pushConns do
+            pushConns[i]:Disconnect()
+        end
 
-    restorePush()
+        table.clear(pushConns)
+
+        restorePush()
+    end
 end
 
 --==================================================
@@ -2208,17 +2179,13 @@ end
 
 local function fullCleanup()
     setFly(false)
-
     setSeatPicker(false)
-
     cleanupSeat(true)
-
     stopPushGuard()
+    stopDrag()
 
-    if highlight then
-        pcall(highlight.Destroy, highlight)
-        highlight = nil
-    end
+    destroy(highlight)
+    highlight = nil
 
     if seatStateConnection then
         seatStateConnection:Disconnect()
@@ -2241,9 +2208,7 @@ local function fullCleanup()
         end)
     end
 
-    if gui and gui.Parent then
-        gui:Destroy()
-    end
+    destroy(gui)
 
     for _, name in ipairs(CLEANUP_NAMES) do
         ENV[name] = nil
